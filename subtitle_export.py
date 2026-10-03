@@ -99,6 +99,65 @@ class SubtitleConfig:
         return SubtitleConfig(**values)
 
 
+@dataclass(frozen=True)
+class ExportConfig:
+    """一次导出的完整、不可变快照。
+
+    ``subtitle_config`` 只包含 GUI 样式与已经合并好的 mpv 字号/位置；
+    延迟和三个路径也在同一对象中冻结。FFmpeg 线程只消费这个对象，因而
+    导出过程中 mpv 或 GUI 控件再次变化不会造成前后参数不一致。
+    """
+
+    input_video: str
+    subtitle_path: str
+    output_video: str
+    subtitle_config: SubtitleConfig
+    sub_scale: float = 1.0
+    sub_pos: float = 100.0
+    sub_delay: float = 0.0
+    audio_delay: float = 0.0
+
+    @property
+    def style_config(self) -> SubtitleConfig:
+        """兼容 UI/调用方使用的样式别名。"""
+
+        return self.subtitle_config
+
+    # 常用 GUI 字段的只读代理。这样调用方可以直接检查完整快照，仍由
+    # ``subtitle_config`` 保持唯一存储，避免出现两份可能不一致的样式。
+    @property
+    def font_name(self) -> str:
+        return str(self.subtitle_config.font_name)
+
+    @property
+    def font_size(self) -> int:
+        return int(self.subtitle_config.font_size)
+
+    @property
+    def primary_color(self) -> ColorValue:
+        return self.subtitle_config.primary_color
+
+    @property
+    def outline_width(self) -> int:
+        return int(self.subtitle_config.outline_width)
+
+    @property
+    def background_enabled(self) -> bool:
+        return bool(self.subtitle_config.background_enabled)
+
+    @property
+    def background_color(self) -> ColorValue:
+        return self.subtitle_config.background_color
+
+    def playback_values(self) -> dict[str, float]:
+        return {
+            "sub_scale": self.sub_scale,
+            "sub_pos": self.sub_pos,
+            "sub_delay": self.sub_delay,
+            "audio_delay": self.audio_delay,
+        }
+
+
 def _config_from_mapping(value: object) -> SubtitleConfig:
     """将 UI 常用的字典配置规范化为 ``SubtitleConfig``。"""
 
@@ -180,32 +239,83 @@ def config_for_playback_state(
     # 未传播放器状态时，保留 UI 样式的字号/位置设置。不能把默认
     # ``sub_pos=100`` 当成状态覆盖掉 config.margin_vertical。
     if playback_state is None:
-        return base
+        return base.copy()
     values = playback_state_values(playback_state)
     try:
         scale = max(0.01, float(values.get("sub_scale", 1.0)))
     except (TypeError, ValueError):
         scale = 1.0
-    raw_base_size = values.get("sub_font_size")
-    try:
-        base_size = float(raw_base_size) if raw_base_size is not None else float(base.font_size)
-    except (TypeError, ValueError):
-        base_size = float(base.font_size)
+    # 字号的唯一基准来自 GUI。mpv 只提供缩放比例；即使历史版本状态
+    # 中残留了 sub_font_size，也不能让它覆盖用户在样式面板选择的字号。
+    base_size = float(base.font_size)
     base_size = max(1.0, base_size)
     height = video_height if video_height is not None else base.play_res_y
-    # mpv 的 sub-pos 从画面顶部计数（0=顶部，100=底部），而 ASS 底部
-    # 对齐样式的 MarginV 从底边计数，所以要反向线性换算：
-    #     MarginV = round((100 - sub_pos) / 100 * PlayResY)
-    # 这里使用 ASS PlayResY，而不是实际窗口像素，FFmpeg/libass 会按
-    # 视频尺寸缩放；因此预览和成片在不同分辨率下仍保持同一相对位置。
+    # Alignment=2 从底边向上计算 MarginV，因此先按 mpv 的百分比反向
+    # 插值。极端的 sub-pos=0 可能把文本推到画面之外，最后用字号和
+    # 安全边距做上限裁剪；常用的中间位置仍严格遵循：
+    #   MarginV = round((100-sub_pos) / 100 * PlayResY)
     try:
         position = max(0.0, min(100.0, float(values.get("sub_pos", 100.0))))
     except (TypeError, ValueError):
         position = 100.0
-    margin_v = int(round((100.0 - position) * max(1, int(height)) / 100.0))
+    raw_margin = int(round((100.0 - position) * max(1, int(height)) / 100.0))
+    scaled_font = max(1, int(round(base_size * scale)))
+    max_margin = max(0, max(1, int(height)) - scaled_font - base.margin_vertical)
+    margin_v = min(raw_margin, max_margin)
     return base.copy(
         font_size=max(1, int(round(base_size * scale))),
         margin_vertical=margin_v,
+    )
+
+
+def merge_export_config(
+    gui_config: Optional[Union[SubtitleConfig, dict]],
+    playback_state: object,
+    input_video: Union[str, os.PathLike[str]],
+    subtitle_path: Union[str, os.PathLike[str]],
+    output_video: Union[str, os.PathLike[str]],
+    *,
+    video_height: Optional[int] = None,
+) -> ExportConfig:
+    """合并 GUI 配置、mpv 快照和文件路径，返回唯一导出真相。
+
+    该函数应在创建 ``QThread`` 之前调用一次。``playback_state`` 可以是
+    ``PlaybackState``、其 ``snapshot()`` 字典或普通映射；读取后立即规范化，
+    线程中不再回读 GUI 控件或活跃的 mpv 对象。
+    """
+
+    values = playback_state_values(playback_state)
+    # None 表示当前没有 mpv 播放器：此时必须完整保留 GUI 自己的
+    # MarginV/位置设置，不能把 PlaybackState 的默认 sub-pos=100 当成覆盖。
+    effective_style = config_for_playback_state(
+        gui_config,
+        playback_state,
+        video_height=video_height,
+    )
+    # SubtitleConfig 本身是可变 dataclass；即使没有连接 mpv，仍要复制一份
+    # 才能让 ExportConfig 真正成为不可变的导出快照，避免面板后续改色影响
+    # 已经启动的 FFmpeg 线程。
+    if isinstance(effective_style, SubtitleConfig):
+        effective_style = effective_style.copy()
+
+    def number(name: str, default: float) -> float:
+        try:
+            value = float(values.get(name, default))
+            return value if value == value and abs(value) != float("inf") else default
+        except (TypeError, ValueError):
+            return default
+
+    scale = max(0.01, number("sub_scale", 1.0))
+    position = max(0.0, min(100.0, number("sub_pos", 100.0)))
+    return ExportConfig(
+        input_video=os.fspath(input_video),
+        subtitle_path=os.fspath(subtitle_path),
+        output_video=os.fspath(output_video),
+        subtitle_config=effective_style,
+        sub_scale=scale,
+        sub_pos=position,
+        sub_delay=number("sub_delay", 0.0),
+        audio_delay=number("audio_delay", 0.0),
     )
 
 
@@ -302,6 +412,25 @@ def ass_color(value: ColorValue, *, default_alpha: int = 255) -> str:
     return f"&H{ass_alpha:02X}{blue:02X}{green:02X}{red:02X}&"
 
 
+def hex_to_ass_color(value: str, *, alpha: Optional[int] = None) -> str:
+    """把 UI 的十六进制颜色转换成 ASS ``&HAABBGGRR&``。
+
+    UI 颜色通常是 ``#RRGGBB``；ASS 则要求蓝、绿、红倒序，并且透明度
+    是反向 alpha（``00`` 完全不透明）。例如 ``#FF0000`` 会得到
+    ``&H000000FF&``。当调用方显式提供 ``alpha`` 时，它表示 CSS 语义的
+    不透明度 0~255；省略时沿用颜色本身（六位颜色按 255 处理）。
+    """
+
+    text = str(value or "").strip()
+    if alpha is None:
+        return ass_color(text)
+    try:
+        opacity = max(0, min(255, int(alpha)))
+    except (TypeError, ValueError):
+        opacity = 255
+    return ass_color(text, default_alpha=opacity)
+
+
 def _ass_time(seconds: float) -> str:
     """将秒数转换为 ASS 的 h:mm:ss.cc 格式。"""
 
@@ -368,7 +497,9 @@ def _position_override(config: SubtitleConfig) -> str:
 
     if not config.x_offset and not config.y_offset:
         return ""
-    alignment = _position_alignment(config.position)
+    # 导出的硬字幕与 force_style 保持同一锚点：底部居中。位置变化只
+    # 通过 MarginV 表达，避免 libass 未应用 force_style 时退回左侧。
+    alignment = 2
     horizontal_index = (alignment - 1) % 3
     vertical_index = (alignment - 1) // 3
     x = {0: config.margin_horizontal, 1: config.play_res_x // 2, 2: config.play_res_x - config.margin_horizontal}[horizontal_index]
@@ -404,7 +535,9 @@ def srt_to_ass_text(
     back_alpha = config.background_opacity if config.background_enabled else 0
     back = ass_color(config.background_color, default_alpha=back_alpha)
     border_style = 3 if config.background_enabled else 1
-    alignment = _position_alignment(config.position)
+    # 导出的硬字幕与 force_style 保持同一锚点：底部居中。位置变化只
+    # 通过 MarginV 表达，避免 libass 未应用 force_style 时退回左侧。
+    alignment = 2
     # ASS 样式字段顺序固定，避免不同 FFmpeg 版本解析失败。
     header = f"""[Script Info]
 ; Generated by Video_to_Srt
@@ -511,10 +644,18 @@ def force_style_from_config(config: Optional[Union[SubtitleConfig, dict]] = None
     """
 
     current = _config_from_mapping(config or SubtitleConfig())
-    primary = ass_color(current.primary_color)
-    outline = ass_color(current.outline_color)
+
+    def style_color(value: ColorValue, *, opacity: int = 255) -> str:
+        # UI 通常传入 #RRGGBB，显式走 hex_to_ass_color；QColor/RGB 元组
+        # 仍由通用 ass_color 处理，避免破坏现有调用方。
+        if isinstance(value, (str, bytes)):
+            return hex_to_ass_color(value.decode() if isinstance(value, bytes) else value, alpha=opacity)
+        return ass_color(value, default_alpha=opacity)
+
+    primary = style_color(current.primary_color)
+    outline = style_color(current.outline_color)
     back_alpha = current.background_opacity if current.background_enabled else 0
-    back = ass_color(current.background_color, default_alpha=back_alpha)
+    back = style_color(current.background_color, opacity=back_alpha)
     values = {
         "Fontname": str(current.font_name),
         "Fontsize": str(max(1, int(current.font_size))),
@@ -523,7 +664,9 @@ def force_style_from_config(config: Optional[Union[SubtitleConfig, dict]] = None
         "BackColour": back,
         "BorderStyle": "3" if current.background_enabled else "1",
         "Outline": str(max(0, int(current.outline_width))),
-        "Alignment": str(_position_alignment(current.position)),
+        # 硬字幕导出统一使用底部居中。垂直位置由 MarginV 表达，避免
+        # ASS 的对齐模式和 mpv sub-pos 同时改变导致字幕落到左侧/中部。
+        "Alignment": "2",
         "MarginL": str(max(0, int(current.margin_horizontal))),
         "MarginR": str(max(0, int(current.margin_horizontal))),
         "MarginV": str(max(0, int(current.margin_vertical))),
@@ -553,6 +696,7 @@ def build_hardsub_command(
     playback_state: object = None,
     video_height: Optional[int] = None,
     audio_delay: Optional[float] = None,
+    export_config: Optional[ExportConfig] = None,
 ) -> list[str]:
     """构建 ``subprocess.Popen`` 可直接使用的 FFmpeg 参数列表。
 
@@ -562,8 +706,17 @@ def build_hardsub_command(
     新参数都是可选的。
     """
 
-    input_video = str(input_video)
-    output_video = str(output_video)
+    if export_config is not None:
+        # ExportConfig 已经冻结了完整状态；不要再次传 playback_state，
+        # 否则字号会被重复乘一次 sub_scale。
+        input_video = export_config.input_video
+        output_video = export_config.output_video
+        subtitle_config = export_config.subtitle_config
+        playback_state = None
+        audio_delay = export_config.audio_delay
+    else:
+        input_video = str(input_video)
+        output_video = str(output_video)
     effective_config = config_for_playback_state(subtitle_config, playback_state, video_height=video_height)
     style = force_style_from_config(effective_config)
     ass_filter = f"subtitles='{escape_subtitles_filter_path(ass_path)}':force_style='{style}'"
@@ -760,6 +913,7 @@ def derive_output_path(
 
 
 __all__ = [
+    "ExportConfig",
     "PlaybackState",
     "SubtitleConfig",
     "config_for_playback_state",
@@ -770,6 +924,7 @@ __all__ = [
     "convert_srt_to_ass",
     "derive_output_path",
     "escape_subtitles_filter_path",
+    "hex_to_ass_color",
     "force_style_from_config",
     "ffmpeg_binary",
     "parse_ffmpeg_duration",
@@ -777,6 +932,7 @@ __all__ = [
     "parse_ffmpeg_time",
     "parse_progress_line",
     "playback_state_values",
+    "merge_export_config",
     "probe_duration",
     "probe_media_duration",
     "srt_to_ass",

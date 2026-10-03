@@ -16,6 +16,7 @@ from audio_translation import translate_media_to_english_mp3
 from subtitle_style_dialog import SubtitleStyleDialog
 from playback_state import get_playback_state
 from mpv_controller import MpvController
+from subtitle_export import SubtitleConfig
 
 
 class AudioTranslationThread(QThread):
@@ -109,8 +110,12 @@ class MyApp(QWidget):
         # 播放器与导出面板共享同一个线程安全状态中枢。mpv OSD 菜单
         # 改动的字号、位置和延迟会实时写入这里，导出时读取一次快照。
         self.playback_state = get_playback_state()
+        # 主窗口持有唯一的 GUI 字幕样式对象。手动导出面板和 mpv 菜单
+        # 触发的导出都引用它，避免自动导出重新创建默认样式。
+        self.subtitle_config = SubtitleConfig()
         self.mpv_controller = None
         self.current_video_path = None
+        self.current_subtitle_path = None
         self.mpv_export_requested.connect(self._export_from_mpv)
         self.initUI()
     def showSuccessMessage(self):
@@ -387,8 +392,19 @@ class MyApp(QWidget):
 
     def openSubtitleExport(self):
         """打开字幕样式面板，在独立线程中执行硬字幕压制。"""
-        dialog = SubtitleStyleDialog(self, playback_state=self.playback_state)
+        dialog = SubtitleStyleDialog(
+            self,
+            config=self.subtitle_config,
+            playback_state=self.playback_state if self._mpv_is_running() else None,
+        )
+        dialog.export_requested.connect(self._remember_export_paths)
         dialog.exec_()
+
+    def _remember_export_paths(self, video, subtitle, _output, _config):
+        """保存最近一次手动导出的字幕路径，供 mpv 一键导出复用。"""
+
+        self.current_video_path = str(video)
+        self.current_subtitle_path = str(subtitle)
 
     def _on_mpv_event(self, message):
         """在 IPC 线程中接收 Lua 的 client-message，再切回 Qt 线程。"""
@@ -412,12 +428,18 @@ class MyApp(QWidget):
         source = Path(video)
         # 生成字幕通常会保存为同名 .srt；同时兼容本项目翻译输出的常见后缀。
         candidates = [
-            source.with_suffix(".srt"),
+            Path(self.current_subtitle_path)
+            if self.current_subtitle_path
+            and self.current_video_path
+            and os.path.normcase(os.path.abspath(self.current_video_path))
+            == os.path.normcase(os.path.abspath(video))
+            else None,
             source.with_name(source.stem + "-zh&en.srt"),
             source.with_name(source.stem + "-zh.srt"),
             source.with_name(source.stem + "-en.srt"),
+            source.with_suffix(".srt"),
         ]
-        subtitle = next((str(path) for path in candidates if path.is_file()), None)
+        subtitle = next((str(path) for path in candidates if path is not None and path.is_file()), None)
         if subtitle is None:
             message = "一键导出失败：未找到与视频同名的 SRT 字幕文件。"
             self.textbox.setText(message)
@@ -434,10 +456,14 @@ class MyApp(QWidget):
             self,
             video_path=str(source),
             subtitle_path=subtitle,
+            config=self.subtitle_config,
             playback_state=self.playback_state,
             auto_start_export=True,
         )
         dialog.exec_()
+
+    def _mpv_is_running(self):
+        return self.mpv_controller is not None and self.mpv_controller.running
 
     def closeEvent(self, event):
         # 关闭主窗口前同步最后一帧 mpv 属性，防止用户刚在 OSD 中调整的

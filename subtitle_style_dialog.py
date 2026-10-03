@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - 仅供独立复制面板时使用
 # subtitle_export.py / ffmpeg_worker.py 由核心实现提供。这里集中导入，
 # 方便未来替换核心模块，也避免把 FFmpeg 进程放在 GUI 线程。
 try:
-    from subtitle_export import SubtitleConfig  # type: ignore
+    from subtitle_export import ExportConfig, SubtitleConfig, merge_export_config  # type: ignore
     try:
         from subtitle_export import derive_output_path  # type: ignore
     except ImportError:
@@ -60,6 +60,8 @@ try:
 except ImportError:  # pragma: no cover - 仅在核心模块尚未安装时提供清晰错误
     HardSubtitleWorker = None  # type: ignore
     SubtitleConfig = None  # type: ignore
+    ExportConfig = None  # type: ignore
+    merge_export_config = None  # type: ignore
     derive_output_path = None  # type: ignore
 
 
@@ -211,6 +213,7 @@ class SubtitleStyleDialog(QDialog):
         self.ffmpeg_path = ffmpeg_path
         self.playback_state = playback_state
         self.auto_start_export = bool(auto_start_export)
+        self.export_config: Any = None
         self._default_output = ""
         self._state_timer = QTimer(self)
         self._state_timer.setInterval(300)
@@ -517,18 +520,33 @@ class SubtitleStyleDialog(QDialog):
             return
 
         self._sync_config()
-        self.export_requested.emit(video, subtitle, output, self.config)
+        # 在 GUI 线程中一次性合并控件与 mpv 快照，之后 worker 只消费这份
+        # 不可变 ExportConfig，避免导出过程中状态再次变化造成脱节。
+        if merge_export_config is not None:
+            self.export_config = merge_export_config(
+                self.config,
+                self.playback_state,
+                video,
+                subtitle,
+                output,
+            )
+        self.export_requested.emit(video, subtitle, output, self.export_config or self.config)
         self._set_export_running(True)
         self.progress_bar.setValue(0)
         self.status_label.setText("正在初始化…")
         try:
             kwargs = {"ffmpeg_path": self.ffmpeg_path} if self.ffmpeg_path else {}
-            if self.playback_state is not None:
-                kwargs["playback_state"] = self.playback_state
-            self.worker = HardSubtitleWorker(video, subtitle, output, self.config, **kwargs)
+            if self.export_config is not None:
+                kwargs["export_config"] = self.export_config
+                worker_config = self.export_config.subtitle_config
+            else:
+                worker_config = self.config
+                if self.playback_state is not None:
+                    kwargs["playback_state"] = self.playback_state
+            self.worker = HardSubtitleWorker(video, subtitle, output, worker_config, **kwargs)
         except TypeError:
             # 兼容核心实现未暴露 ffmpeg_path 参数的旧接口。
-            self.worker = HardSubtitleWorker(video, subtitle, output, self.config)
+            self.worker = HardSubtitleWorker(video, subtitle, output, worker_config)
         _connect_signal(self.worker, ("progress", "progress_signal"), self._on_progress)
         _connect_signal(self.worker, ("status", "status_signal", "message_signal"), self._on_status)
         _connect_signal(self.worker, ("finished", "finished_signal", "success"), self._on_finished)
