@@ -11,6 +11,40 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 from PyQt5.QtWidgets import QProgressBar
 from PyQt5.QtGui import QIcon
 from multiprocessing import freeze_support
+from pathlib import Path
+from audio_translation import translate_media_to_english_mp3
+
+
+class AudioTranslationThread(QThread):
+    finished_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, str)
+
+    def __init__(self, media_path, output_path, speech_keys, translation_keys, source_language, target_language):
+        super().__init__()
+        self.media_path = media_path
+        self.output_path = output_path
+        self.speech_keys = speech_keys
+        self.translation_keys = translation_keys
+        self.source_language = source_language
+        self.target_language = target_language
+
+    def run(self):
+        try:
+            output = translate_media_to_english_mp3(
+                self.media_path,
+                self.output_path,
+                self.speech_keys,
+                self.translation_keys,
+                progress=lambda value, message: self.progress_signal.emit(value, message),
+                source_language=self.source_language,
+                target_language=self.target_language,
+            )
+            self.finished_signal.emit(output)
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
+
+
 class GenerateSubtitlesThread(QThread):
     signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int)  # 新增进度信号
@@ -142,6 +176,15 @@ class MyApp(QWidget):
         btn3 = QPushButton('字幕文件翻译', self)
         btn3.clicked.connect(self.translateSubtitle)
 
+        self.audioDirectionComboBox = QComboBox(self)
+        self.audioDirectionComboBox.addItem("中文转换为英文")
+        self.audioDirectionComboBox.addItem("英文转换成中文")
+        self.audioDirectionComboBox.setFixedWidth(200)
+
+        btnAudio = QPushButton('音频/视频翻译为 MP3', self)
+        btnAudio.clicked.connect(self.translateAudioToMp3)
+        self.audioButton = btnAudio
+
         btn4 = QPushButton('退出', self)
         btn4.clicked.connect(QApplication.instance().quit)
         self.textbox = QTextEdit(self)  # 创建一个文本框
@@ -162,11 +205,16 @@ class MyApp(QWidget):
         hboxTranslateSubtitle.addWidget(self.comboBox)
         hboxTranslateSubtitle.addWidget(btn3)
 
+        hboxAudioTranslation = QHBoxLayout()
+        hboxAudioTranslation.addWidget(self.audioDirectionComboBox)
+        hboxAudioTranslation.addWidget(btnAudio)
+
         vbox = QVBoxLayout()
         vbox.addLayout(hboxTop)  # 添加顶部的水平布局到垂直布局
         vbox.addWidget(btn1)
         vbox.addLayout(hboxGenerateSubtitles)  # 添加视频生成字幕和语言选择的水平布局
         vbox.addLayout(hboxTranslateSubtitle)  # 添加字幕文件翻译和语言选择的水平布局
+        vbox.addLayout(hboxAudioTranslation)
         vbox.addWidget(btn4)
         vbox.addWidget(self.progressBar)
         vbox.addWidget(self.textbox)  # 把文本框添加到布局中
@@ -229,6 +277,80 @@ class MyApp(QWidget):
             self.thread.progress_signal.connect(self.progressBar.setValue)
             self.thread.start()
             print("线程已启动")
+
+    def translateAudioToMp3(self):
+        choice = self.audioDirectionComboBox.currentText()
+        if choice == "英文转换成中文":
+            source_language, target_language = "en", "zh"
+            source_label, output_suffix = "英文", "zh"
+        elif choice == "中文转换为英文":
+            source_language, target_language = "zh", "en"
+            source_label, output_suffix = "中文", "en"
+        else:
+            QMessageBox.warning(self, "错误", "请选择音频翻译方向。")
+            return
+
+        speech_api_key, speech_secret_key = get_api_keys()
+        if not speech_api_key or not speech_secret_key:
+            QMessageBox.warning(self, "错误", "语音识别/合成密钥无效，请检查 apikey.txt。")
+            return
+
+        translation_ak, translation_sk = get_translation_keys()
+        if not translation_ak or not translation_sk:
+            QMessageBox.warning(self, "错误", "机器翻译密钥无效，请检查 translationkey.txt。")
+            return
+
+        media_path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"选择{source_label}音频或视频",
+            "./",
+            "媒体文件 (*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.mp4 *.mkv *.mov *.avi *.webm);;所有文件 (*)",
+        )
+        if not media_path:
+            return
+
+        source = Path(media_path)
+        output_path = str(source.with_name(source.stem + f"-{output_suffix}.mp3"))
+        if Path(output_path).exists():
+            answer = QMessageBox.question(
+                self,
+                "覆盖文件？",
+                f"目标文件已存在，是否覆盖？\n{output_path}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        self.progressBar.setValue(0)
+        self.textbox.setText(f"正在准备{source_label}音频翻译…")
+        self.audioButton.setEnabled(False)
+        self.audioThread = AudioTranslationThread(
+            media_path,
+            output_path,
+            (speech_api_key, speech_secret_key),
+            (translation_ak, translation_sk),
+            source_language=source_language,
+            target_language=target_language,
+        )
+        self.audioThread.progress_signal.connect(self.onAudioProgress)
+        self.audioThread.finished_signal.connect(self.onAudioFinished)
+        self.audioThread.error_signal.connect(self.onAudioFailed)
+        self.audioThread.start()
+
+    def onAudioProgress(self, value, message):
+        self.progressBar.setValue(value)
+        self.textbox.setText(message)
+
+    def onAudioFinished(self, output_path):
+        self.audioButton.setEnabled(True)
+        self.textbox.setText("翻译 MP3 已保存到：\n" + output_path)
+        QMessageBox.information(self, "完成", "翻译 MP3 已生成：\n" + output_path)
+
+    def onAudioFailed(self, error):
+        self.audioButton.setEnabled(True)
+        self.textbox.setText("MP3 生成失败：\n" + error)
+        QMessageBox.critical(self, "生成失败", error)
 
     def onFinished(self, result):
         self.textbox.setText("文件生成地址：" + result)

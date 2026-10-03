@@ -101,10 +101,26 @@ def extract_audio(filepath, channels=1, rate=16000):
     # 使用完整路径的ffmpeg
     command = [ffmpeg_path, "-y", "-i", filepath, "-ac", str(channels), "-ar", str(rate), "-loglevel", "error",
                tempname]
-    use_shell = True if os.name == "nt" else False
-    subprocess.check_output(command, stdin=open(os.devnull), shell=use_shell)
+    _run_ffmpeg(command)
 
     return tempname, rate
+
+
+def _run_ffmpeg(command):
+    """Run FFmpeg with deterministic decoding for diagnostic output on Windows."""
+    result = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=False,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or "FFmpeg 处理失败"
+        raise RuntimeError(detail)
 
 #定义percentile函数，用于计算数组的百分位数
 def percentile(arr, percent):
@@ -137,6 +153,8 @@ def find_speech_regions(filename, frame_width=4096, min_region_size=0.5, max_reg
         chunk = reader.readframes(frame_width)
         energies.append(audioop.rms(chunk, sample_width * n_channels))
     # 计算能量阈值，低于此阈值的帧被认为是静音
+    if not energies:
+        return []
     threshold = percentile(energies, 0.2)
     # 初始化已经过去的时间
     elapsed_time = 0
@@ -151,19 +169,22 @@ def find_speech_regions(filename, frame_width=4096, min_region_size=0.5, max_reg
         # 判断当前帧是否为静音
         is_silence = energy <= threshold
         # 判断当前语音区域的时长是否超过最大时长
-        max_exceeded = region_start and elapsed_time - region_start >= max_region_size
+        max_exceeded = region_start is not None and elapsed_time - region_start >= max_region_size
         # 如果当前语音区域的时长超过最大时长或者当前帧为静音，并且存在正在记录的语音区域，则结束当前语音区域的记录
-        if (max_exceeded or is_silence) and region_start:
+        if (max_exceeded or is_silence) and region_start is not None:
             # 如果当前语音区域的时长大于等于最小时长，则将其添加到语音区域列表中
             if elapsed_time - region_start >= min_region_size:
                 num = num + 1
                 regions.append((region_start, elapsed_time, num))
                 region_start = None
         # 如果没有正在记录的语音区域，并且当前帧不是静音，则开始记录新的语音区
-        elif (not region_start) and (not is_silence):
+        elif region_start is None and not is_silence:
             region_start = elapsed_time
         # 更新已经过去的时间
         elapsed_time += chunk_duration
+    if region_start is not None and elapsed_time - region_start >= min_region_size:
+        num += 1
+        regions.append((region_start, elapsed_time, num))
     # 返回语音区域列表
     return regions
 
@@ -188,8 +209,7 @@ class WAVConverter(object):
                        "-y", "-i", self.source_path,
                        "-loglevel", "error", tempname]
 
-            use_shell = True if os.name == "nt" else False
-            subprocess.check_output(command, stdin=open(os.devnull), shell=use_shell)
+            _run_ffmpeg(command)
             return tempname
         except KeyboardInterrupt:
             return 1
