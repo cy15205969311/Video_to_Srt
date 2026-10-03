@@ -114,11 +114,12 @@ class MpvController:
         if process is None:
             return
         process.wait()
-        # mpv 关闭前的 property-change 可能还在 IPC 缓冲区；close(sync=True)
-        # 会再发送 get_property 并保存最终值。
+        # 进程已经退出，命名管道可能不再接受新的 get_property 写入；
+        # 退出前的 property-change 已由 IPC 读取线程处理，因此这里关闭时
+        # 不再发送同步请求，避免 Windows named pipe 写端永久阻塞。
         ipc = self.ipc
         if ipc is not None:
-            ipc.close(persist=True, sync=True)
+            ipc.close(persist=True, sync=False)
 
     def command(self, *command: object, wait: bool = False):
         """向当前 mpv 发送 JSON IPC command。"""
@@ -133,16 +134,24 @@ class MpvController:
         with self._lock:
             ipc = self.ipc
             self.ipc = None
-            if ipc is not None:
-                ipc.close(persist=persist, sync=True)
             process = self.process
             self.process = None
-            if process is not None and process.poll() is None and terminate:
+            # Windows named pipe 的 close() 可能等待 reader 线程；先结束 mpv
+            # 让服务端关闭管道，再关闭客户端句柄可避免 GUI 永久卡住。进程
+            # 仍在时先同步属性，保证最后一次 OSD 调整进入 PlaybackState。
+            if ipc is not None and terminate and process is not None and process.poll() is None:
+                try:
+                    ipc.sync_state(timeout=min(0.5, ipc.request_timeout))
+                except (OSError, RuntimeError, ValueError):
+                    pass
                 process.terminate()
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                ipc.close(persist=persist, sync=False)
+            elif ipc is not None:
+                ipc.close(persist=persist, sync=True)
             monitor = self._monitor_thread
             self._monitor_thread = None
             if monitor and monitor is not threading.current_thread():

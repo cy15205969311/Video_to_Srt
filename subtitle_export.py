@@ -444,6 +444,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             shift = float(subtitle_delay)
         except (TypeError, ValueError):
             shift = 0.0
+        if shift != shift or abs(shift) == float("inf"):
+            shift = 0.0
         start += shift
         end += shift
         if end <= 0:
@@ -774,6 +776,7 @@ __all__ = [
     "parse_ffmpeg_progress",
     "parse_ffmpeg_time",
     "parse_progress_line",
+    "playback_state_values",
     "probe_duration",
     "probe_media_duration",
     "srt_to_ass",
