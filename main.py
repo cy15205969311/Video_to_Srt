@@ -4,7 +4,7 @@ from translation import get_token, read_subtitle_file, translate_text, write_sub
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QComboBox, QTextEdit, QFileDialog, QLabel, QHBoxLayout, \
     QDialog
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
-import subprocess
+import os
 from videotosrt import get_api_keys
 from translation import get_translation_keys
 from PyQt5.QtWidgets import QApplication, QMessageBox
@@ -13,6 +13,9 @@ from PyQt5.QtGui import QIcon
 from multiprocessing import freeze_support
 from pathlib import Path
 from audio_translation import translate_media_to_english_mp3
+from subtitle_style_dialog import SubtitleStyleDialog
+from playback_state import get_playback_state
+from mpv_controller import MpvController
 
 
 class AudioTranslationThread(QThread):
@@ -99,6 +102,10 @@ class TranslateSubtitleThread(QThread):
 class MyApp(QWidget):
     def __init__(self):
         super().__init__()
+        # 播放器与导出面板共享同一个线程安全状态中枢。mpv OSD 菜单
+        # 改动的字号、位置和延迟会实时写入这里，导出时读取一次快照。
+        self.playback_state = get_playback_state()
+        self.mpv_controller = None
         self.initUI()
     def showSuccessMessage(self):
         msg = QMessageBox()
@@ -185,6 +192,9 @@ class MyApp(QWidget):
         btnAudio.clicked.connect(self.translateAudioToMp3)
         self.audioButton = btnAudio
 
+        btnHardSubtitle = QPushButton('字幕样式/硬字幕导出', self)
+        btnHardSubtitle.clicked.connect(self.openSubtitleExport)
+
         btn4 = QPushButton('退出', self)
         btn4.clicked.connect(QApplication.instance().quit)
         self.textbox = QTextEdit(self)  # 创建一个文本框
@@ -215,6 +225,7 @@ class MyApp(QWidget):
         vbox.addLayout(hboxGenerateSubtitles)  # 添加视频生成字幕和语言选择的水平布局
         vbox.addLayout(hboxTranslateSubtitle)  # 添加字幕文件翻译和语言选择的水平布局
         vbox.addLayout(hboxAudioTranslation)
+        vbox.addWidget(btnHardSubtitle)
         vbox.addWidget(btn4)
         vbox.addWidget(self.progressBar)
         vbox.addWidget(self.textbox)  # 把文本框添加到布局中
@@ -228,8 +239,22 @@ class MyApp(QWidget):
     def openVideo(self):
         fname = QFileDialog.getOpenFileName(self, 'Open file', './')
         if fname[0]:
-            mpv_path = "./mpv/mpv.exe"
-            subprocess.call([mpv_path, fname[0]])
+            mpv_path = Path(__file__).resolve().parent / "mpv" / ("mpv.exe" if os.name == "nt" else "mpv")
+            try:
+                # Popen + JSON IPC 让 GUI 保持响应，并持续监听 mpv 的
+                # property-change 事件。关闭播放器时控制器会先查询最后
+                # 一次属性，再持久化到 portable_config/persistent_config.json。
+                if self.mpv_controller is None:
+                    self.mpv_controller = MpvController(
+                        mpv_path,
+                        config_dir=Path(__file__).resolve().parent / "mpv" / "portable_config",
+                        state=self.playback_state,
+                    )
+                self.mpv_controller.start(fname[0])
+                self.textbox.setText("mpv 播放器已启动，右键菜单调整的字幕参数会同步到导出面板。")
+            except Exception as exc:
+                self.mpv_controller = None
+                QMessageBox.critical(self, "播放器启动失败", str(exc))
 
     def translateSubtitle(self):
 
@@ -351,6 +376,22 @@ class MyApp(QWidget):
         self.audioButton.setEnabled(True)
         self.textbox.setText("MP3 生成失败：\n" + error)
         QMessageBox.critical(self, "生成失败", error)
+
+    def openSubtitleExport(self):
+        """打开字幕样式面板，在独立线程中执行硬字幕压制。"""
+        dialog = SubtitleStyleDialog(self, playback_state=self.playback_state)
+        dialog.exec_()
+
+    def closeEvent(self, event):
+        # 关闭主窗口前同步最后一帧 mpv 属性，防止用户刚在 OSD 中调整的
+        # 参数尚未进入 persistent_config.json 就被进程结束。
+        if self.mpv_controller is not None:
+            try:
+                self.mpv_controller.close(terminate=True, persist=True)
+            except Exception:
+                pass
+            self.mpv_controller = None
+        event.accept()
 
     def onFinished(self, result):
         self.textbox.setText("文件生成地址：" + result)

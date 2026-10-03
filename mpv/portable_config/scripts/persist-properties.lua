@@ -4,7 +4,9 @@ local utils = require "mp.utils"
 local msg = require "mp.msg"
 
 local opts = {
-    properties = "volume,sub-scale",
+    -- 保留主界面导出所需的全部播放状态。OSD 菜单/快捷键修改后，
+    -- 这些属性会在 mpv 退出时写入 persistent_config.json。
+    properties = "volume,sub-scale,sub-delay,audio-delay,sub-pos",
 }
 (require 'mp.options').read_options(opts, "persist_properties")
 
