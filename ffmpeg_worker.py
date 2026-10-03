@@ -27,6 +27,7 @@ from subtitle_export import (
     parse_progress_line,
     playback_state_values,
     probe_media_duration,
+    probe_video_height,
 )
 
 
@@ -109,6 +110,17 @@ class HardSubtitleWorker(QThread):
                 if callable(snapshot):
                     state = snapshot()
                 state_values = playback_state_values(state)
+                input_video = self.input_video
+                srt_path = self.srt_path
+                output_video = self.output_video
+                # 旧接口没有在 GUI 线程创建 ExportConfig 时，在进入
+                # 压制前补探测一次真实视频高度。这样 ASS 文件也会应用
+                # 与 force_style 相同的分辨率字号比例。
+                if self.video_height is None:
+                    self.video_height = probe_video_height(
+                        input_video,
+                        ffprobe_binary(self.ffmpeg_path),
+                    )
                 effective_config = config_for_playback_state(
                     self.config,
                     state,
@@ -122,9 +134,6 @@ class HardSubtitleWorker(QThread):
                     audio_delay = float(state_values.get("audio_delay", 0.0) or 0.0)
                 except (TypeError, ValueError):
                     audio_delay = 0.0
-                input_video = self.input_video
-                srt_path = self.srt_path
-                output_video = self.output_video
             self.status.emit("正在生成 ASS 字幕…")
             # NamedTemporaryFile 在 Windows 上先关闭句柄，否则 FFmpeg 无法读取。
             with tempfile.NamedTemporaryFile(prefix="video_to_srt_", suffix=".ass", delete=False) as handle:

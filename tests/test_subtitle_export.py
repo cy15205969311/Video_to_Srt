@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from subtitle_export import (
     PlaybackState,
@@ -15,12 +16,38 @@ from subtitle_export import (
     merge_export_config,
     parse_ffmpeg_progress,
     parse_ffmpeg_time,
+    probe_video_height,
+    resolution_scaled_config,
     sub_pos_to_margin_v,
     srt_to_ass,
 )
 
 
 class SubtitleExportTests(unittest.TestCase):
+    def test_resolution_scaled_font_and_outline(self):
+        scaled = resolution_scaled_config(
+            SubtitleConfig(font_size=24, outline_width=2),
+            video_height=1080,
+        )
+        self.assertEqual(scaled.font_size, 36)
+        self.assertEqual(scaled.outline_width, 3)
+
+    def test_config_for_playback_state_handles_empty_or_partial_state(self):
+        gui = SubtitleConfig(font_size=22, margin_vertical=77)
+        for state in (None, {}, {"audio_delay": 0.25}, {"sub_scale": 1.5}):
+            current = config_for_playback_state(gui, state)
+            self.assertEqual(current.font_size, 22 if state != {"sub_scale": 1.5} else 33)
+            if state != {"sub_scale": 1.5}:
+                self.assertEqual(current.margin_vertical, 77)
+
+    def test_probe_video_height_reads_first_video_stream(self):
+        completed = type("Completed", (), {"stdout": "1080\n", "stderr": ""})()
+        with patch("subtitle_export.subprocess.run", return_value=completed) as run:
+            self.assertEqual(probe_video_height("input.mp4", "ffprobe.exe"), 1080)
+        command = run.call_args.args[0]
+        self.assertIn("-select_streams", command)
+        self.assertIn("v:0", command)
+
     def test_ass_color_uses_ass_bgr_and_inverse_alpha(self):
         self.assertEqual(ass_color("#12AB34"), "&H0034AB12&")
         self.assertEqual(ass_color("#8012AB34"), "&H7F34AB12&")
@@ -76,7 +103,8 @@ class SubtitleExportTests(unittest.TestCase):
         self.assertEqual(merged.input_video, "video.mp4")
         self.assertEqual(merged.subtitle_path, "captions.srt")
         self.assertEqual(merged.output_video, "rendered.mp4")
-        self.assertEqual(merged.subtitle_config.font_size, 30)
+        # 20px UI 字号 × 1.5 mpv 缩放 × (1000 / 720) 分辨率比例。
+        self.assertEqual(merged.subtitle_config.font_size, 42)
         self.assertEqual(merged.subtitle_config.margin_vertical, 750)
         self.assertEqual(merged.audio_delay, 0.4)
 
@@ -205,7 +233,7 @@ class SubtitleExportTests(unittest.TestCase):
         self.assertIsInstance(plan, ExportConfig)
         self.assertEqual(plan.input_video, "input.mp4")
         self.assertEqual(plan.subtitle_config.font_name, "SimHei")
-        self.assertEqual(plan.subtitle_config.font_size, 30)
+        self.assertEqual(plan.subtitle_config.font_size, 42)
         self.assertEqual(plan.subtitle_config.margin_vertical, 750)
         self.assertEqual(plan.sub_delay, 0.25)
         self.assertEqual(plan.audio_delay, -0.5)
