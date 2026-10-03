@@ -421,10 +421,11 @@ class MyApp(QWidget):
         if subtitle is None:
             message = "一键导出失败：未找到与视频同名的 SRT 字幕文件。"
             self.textbox.setText(message)
-            try:
-                self.mpv_controller.command("show-text", message, 5000)
-            except (OSError, RuntimeError, ValueError):
-                pass
+            if self.mpv_controller is not None:
+                try:
+                    self.mpv_controller.command("show-text", message, 5000)
+                except (OSError, RuntimeError, ValueError):
+                    pass
             return
 
         # 面板仍会显示当前 IPC 快照和进度，但 auto_start_export 使菜单点击
