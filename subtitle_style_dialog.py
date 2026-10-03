@@ -198,6 +198,7 @@ class SubtitleStyleDialog(QDialog):
         config: Any = None,
         ffmpeg_path: Optional[str] = None,
         playback_state: Any = None,
+        auto_start_export: bool = False,
     ):
         super().__init__(parent)
         self.setWindowTitle("字幕导出设置")
@@ -209,6 +210,7 @@ class SubtitleStyleDialog(QDialog):
         self.worker = None
         self.ffmpeg_path = ffmpeg_path
         self.playback_state = playback_state
+        self.auto_start_export = bool(auto_start_export)
         self._default_output = ""
         self._state_timer = QTimer(self)
         self._state_timer.setInterval(300)
@@ -222,6 +224,10 @@ class SubtitleStyleDialog(QDialog):
         self._refresh_playback_state()
         if self.playback_state is not None:
             self._state_timer.start()
+        if self.auto_start_export:
+            # 等待 QDialog 完成初始化并进入事件循环后再启动 QThread，
+            # 这样菜单点击可以直接打开进度面板并开始压制。
+            QTimer.singleShot(0, self._start_export)
 
     # ---- UI 构建 -------------------------------------------------------
     def _build_ui(self) -> None:

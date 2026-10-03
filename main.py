@@ -100,12 +100,18 @@ class TranslateSubtitleThread(QThread):
     def update_progress(self, value):
         self.progress_signal.emit(value)
 class MyApp(QWidget):
+    # mpv IPC reader 在线程中收到 Lua 菜单事件后，只发 Qt 信号；真正的
+    # 对话框和 QThread 创建始终在 GUI 线程执行。
+    mpv_export_requested = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         # 播放器与导出面板共享同一个线程安全状态中枢。mpv OSD 菜单
         # 改动的字号、位置和延迟会实时写入这里，导出时读取一次快照。
         self.playback_state = get_playback_state()
         self.mpv_controller = None
+        self.current_video_path = None
+        self.mpv_export_requested.connect(self._export_from_mpv)
         self.initUI()
     def showSuccessMessage(self):
         msg = QMessageBox()
@@ -250,6 +256,8 @@ class MyApp(QWidget):
                         config_dir=Path(__file__).resolve().parent / "mpv" / "portable_config",
                         state=self.playback_state,
                     )
+                    self.mpv_controller.add_event_listener(self._on_mpv_event)
+                self.current_video_path = fname[0]
                 self.mpv_controller.start(fname[0])
                 self.textbox.setText("mpv 播放器已启动，右键菜单调整的字幕参数会同步到导出面板。")
             except Exception as exc:
@@ -380,6 +388,54 @@ class MyApp(QWidget):
     def openSubtitleExport(self):
         """打开字幕样式面板，在独立线程中执行硬字幕压制。"""
         dialog = SubtitleStyleDialog(self, playback_state=self.playback_state)
+        dialog.exec_()
+
+    def _on_mpv_event(self, message):
+        """在 IPC 线程中接收 Lua 的 client-message，再切回 Qt 线程。"""
+
+        if message.get("event") not in ("client-message", "script-message"):
+            return
+        args = message.get("args") or []
+        if args and str(args[0]) == "export-video-now":
+            self.mpv_export_requested.emit()
+
+    def _export_from_mpv(self):
+        """用当前播放视频及同名 SRT 直接打开导出面板并自动开始压制。"""
+
+        video = self.current_video_path
+        if self.mpv_controller is not None and self.mpv_controller.media_path:
+            video = self.mpv_controller.media_path
+        if not video or not os.path.isfile(video):
+            self.textbox.setText("一键导出失败：当前没有可用的视频文件。")
+            return
+
+        source = Path(video)
+        # 生成字幕通常会保存为同名 .srt；同时兼容本项目翻译输出的常见后缀。
+        candidates = [
+            source.with_suffix(".srt"),
+            source.with_name(source.stem + "-zh&en.srt"),
+            source.with_name(source.stem + "-zh.srt"),
+            source.with_name(source.stem + "-en.srt"),
+        ]
+        subtitle = next((str(path) for path in candidates if path.is_file()), None)
+        if subtitle is None:
+            message = "一键导出失败：未找到与视频同名的 SRT 字幕文件。"
+            self.textbox.setText(message)
+            try:
+                self.mpv_controller.command("show-text", message, 5000)
+            except (OSError, RuntimeError, ValueError):
+                pass
+            return
+
+        # 面板仍会显示当前 IPC 快照和进度，但 auto_start_export 使菜单点击
+        # 后无需再切回主界面或重复点击按钮。
+        dialog = SubtitleStyleDialog(
+            self,
+            video_path=str(source),
+            subtitle_path=subtitle,
+            playback_state=self.playback_state,
+            auto_start_export=True,
+        )
         dialog.exec_()
 
     def closeEvent(self, event):

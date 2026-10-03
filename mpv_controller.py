@@ -15,7 +15,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from playback_state import (
     MpvJsonIpc,
@@ -46,6 +46,8 @@ class MpvController:
         self.endpoint: Optional[str] = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
+        self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
+        self.media_path: Optional[str] = None
 
     @property
     def running(self) -> bool:
@@ -66,6 +68,7 @@ class MpvController:
 
         with self._lock:
             self.close(terminate=True, persist=False)
+            self.media_path = os.fspath(media_path)
             # mpv 原生 IPC 在 Windows 使用命名管道、Unix 使用 Unix
             # domain socket。TCP 端点仍可通过 ipc_endpoint 显式传入，便于
             # 测试，但默认走原生端点以保证便携版 mpv 真正能够创建它。
@@ -105,6 +108,11 @@ class MpvController:
                 self.process.terminate()
                 raise RuntimeError(f"无法连接 mpv JSON IPC: {last_error}")
             self.ipc = ipc
+            # 先挂内部事件处理，再挂主窗口监听器。所有回调均运行在
+            # IPC reader 线程；Qt 主窗口应通过 pyqtSignal 切回 GUI 线程。
+            ipc.add_event_listener(self._handle_ipc_event)
+            for listener in self._event_listeners:
+                ipc.add_event_listener(listener)
             self._monitor_thread = threading.Thread(target=self._monitor_process, name="mpv-process-monitor", daemon=True)
             self._monitor_thread.start()
             return self.state
@@ -136,6 +144,7 @@ class MpvController:
             self.ipc = None
             process = self.process
             self.process = None
+            self.media_path = None
             # Windows named pipe 的 close() 可能等待 reader 线程；先结束 mpv
             # 让服务端关闭管道，再关闭客户端句柄可避免 GUI 永久卡住。进程
             # 仍在时先同步属性，保证最后一次 OSD 调整进入 PlaybackState。
@@ -156,6 +165,35 @@ class MpvController:
             self._monitor_thread = None
             if monitor and monitor is not threading.current_thread():
                 monitor.join(timeout=0.5)
+
+    def add_event_listener(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """监听 mpv JSON 事件（包括 ``client-message``）。"""
+
+        if callback not in self._event_listeners:
+            self._event_listeners.append(callback)
+        if self.ipc is not None:
+            self.ipc.add_event_listener(callback)
+
+    def remove_event_listener(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        try:
+            self._event_listeners.remove(callback)
+        except ValueError:
+            pass
+
+    def _handle_ipc_event(self, message: dict[str, Any]) -> None:
+        """处理 Lua 菜单发出的导出请求，并立即在播放器内反馈。"""
+
+        event_name = message.get("event")
+        args = message.get("args") or []
+        if event_name not in ("client-message", "script-message") or not args:
+            return
+        if str(args[0]) != "export-video-now":
+            return
+        try:
+            self.command("show-text", "开始压制导出视频，请稍候...", 5000)
+        except (OSError, RuntimeError, ValueError):
+            # 播放器可能正好在退出；导出事件仍交给主程序处理。
+            pass
 
     def __enter__(self) -> "MpvController":
         return self

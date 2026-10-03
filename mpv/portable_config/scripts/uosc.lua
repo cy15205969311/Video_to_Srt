@@ -1030,6 +1030,8 @@ bind_command('woniu-tools', function()
 	items[index]={title='字幕位置上移',value='字幕位置上移',keep_open=true};
 	index=index+1
 	items[index]={title='字幕位置下移',value='字幕位置下移',keep_open=true};
+	index=index+1
+	items[index]={title='一键渲染导出视频',value='一键渲染导出视频'};
 	Menu:open({type = 'woniu-tools', title = '设置', items = items}, function(format)
 		if format=='音频延迟+0.5秒' then
 			local audio_delay = mp.get_property_number('audio-delay')
@@ -1061,24 +1063,35 @@ bind_command('woniu-tools', function()
 			mp.osd_message('字幕延迟0')
 		end
 		if format=='字幕字号加大' then
-			local sub_font_size = mp.get_property_number('sub-font-size')
-			mp.set_property_number('sub-font-size', sub_font_size+2)
-			mp.osd_message('字幕字号'..sub_font_size+2)
+			-- 使用 sub-scale，与 Python PlaybackState 的 observe_property
+			-- 保持一致；这样 OSD 调整会直接进入硬字幕导出参数。
+			local sub_scale = mp.get_property_number('sub-scale')
+			sub_scale = math.min(5, sub_scale + 0.1)
+			mp.set_property_number('sub-scale', sub_scale)
+			mp.osd_message('字幕缩放'..string.format('%.2f', sub_scale))
 		end
 		if format=='字幕字号减小' then
-			local sub_font_size = mp.get_property_number('sub-font-size')
-			mp.set_property_number('sub-font-size', sub_font_size-3)
-			mp.osd_message('字幕字号'..sub_font_size-2)
+			local sub_scale = mp.get_property_number('sub-scale')
+			sub_scale = math.max(0.1, sub_scale - 0.1)
+			mp.set_property_number('sub-scale', sub_scale)
+			mp.osd_message('字幕缩放'..string.format('%.2f', sub_scale))
 		end
 		if format=='字幕位置上移' then
-			local sub_margin_y = mp.get_property_number('sub-margin-y')
-			mp.set_property_number('sub-margin-y', sub_margin_y+10)
-			mp.osd_message('字幕位置距离底部'..sub_margin_y+10)
+			local sub_pos = mp.get_property_number('sub-pos')
+			sub_pos = math.max(0, sub_pos - 5)
+			mp.set_property_number('sub-pos', sub_pos)
+			mp.osd_message('字幕位置'..string.format('%.0f%%', sub_pos))
 		end
 		if format=='字幕位置下移' then
-			local sub_margin_y = mp.get_property_number('sub-margin-y')
-			mp.set_property_number('sub-margin-y', sub_margin_y-10)
-			mp.osd_message('字幕位置距离底部'..sub_margin_y-10)
+			local sub_pos = mp.get_property_number('sub-pos')
+			sub_pos = math.min(100, sub_pos + 5)
+			mp.set_property_number('sub-pos', sub_pos)
+			mp.osd_message('字幕位置'..string.format('%.0f%%', sub_pos))
+		end
+		if format=='一键渲染导出视频' then
+			-- 通过 mpv JSON IPC 发送 client-message；Python 端会读取
+			-- PlaybackState 快照并启动 QThread/FFmpeg 压制。
+			mp.commandv('script-message', 'export-video-now')
 		end
 	end)
 end)
