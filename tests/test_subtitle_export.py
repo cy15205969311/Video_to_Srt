@@ -16,6 +16,7 @@ from subtitle_export import (
     merge_export_config,
     parse_ffmpeg_progress,
     parse_ffmpeg_time,
+    probe_video_dimensions,
     probe_video_height,
     resolution_scaled_config,
     sub_pos_to_margin_v,
@@ -29,8 +30,29 @@ class SubtitleExportTests(unittest.TestCase):
             SubtitleConfig(font_size=24, outline_width=2),
             video_height=1080,
         )
-        self.assertEqual(scaled.font_size, 36)
-        self.assertEqual(scaled.outline_width, 3)
+        # SRT/libass 的默认虚拟画布高约 288；24px UI 字号在 1080p
+        # 中应按 1080 / 288 放大，而不是按 720p 计算。
+        self.assertEqual(scaled.font_size, int(24 * 1080 / 288))
+        self.assertEqual(scaled.outline_width, int(2 * 1080 / 288))
+
+    def test_resolution_scaled_sets_video_playres(self):
+        scaled = resolution_scaled_config(
+            SubtitleConfig(font_size=24, outline_width=2),
+            video_width=1920,
+            video_height=1080,
+        )
+        self.assertEqual(scaled.play_res_x, 1920)
+        self.assertEqual(scaled.play_res_y, 1080)
+
+    def test_probe_video_dimensions_reads_width_and_height(self):
+        # `-of csv=p=0:s=x` produces one `widthxheight` line.
+        completed = type("Completed", (), {"stdout": "1920x1080\n", "stderr": ""})()
+        with patch("subtitle_export.subprocess.run", return_value=completed) as run:
+            self.assertEqual(probe_video_dimensions("input.mp4", "ffprobe.exe"), (1920, 1080))
+        command = run.call_args.args[0]
+        self.assertIn("stream=width,height", command)
+        self.assertIn("-select_streams", command)
+        self.assertIn("v:0", command)
 
     def test_config_for_playback_state_handles_empty_or_partial_state(self):
         gui = SubtitleConfig(font_size=22, margin_vertical=77)
@@ -41,12 +63,19 @@ class SubtitleExportTests(unittest.TestCase):
                 self.assertEqual(current.margin_vertical, 77)
 
     def test_probe_video_height_reads_first_video_stream(self):
-        completed = type("Completed", (), {"stdout": "1080\n", "stderr": ""})()
+        completed = type("Completed", (), {"stdout": "1920x1080\n", "stderr": ""})()
         with patch("subtitle_export.subprocess.run", return_value=completed) as run:
             self.assertEqual(probe_video_height("input.mp4", "ffprobe.exe"), 1080)
         command = run.call_args.args[0]
         self.assertIn("-select_streams", command)
         self.assertIn("v:0", command)
+
+    def test_probe_video_height_legacy_height_only_fallback(self):
+        # 旧版或测试替身可能只输出高度；高度助手应继续返回该值，
+        # 不能把 int 当作 (width, height) 再次下标访问。
+        completed = type("Completed", (), {"stdout": "1080\n", "stderr": ""})()
+        with patch("subtitle_export.subprocess.run", return_value=completed):
+            self.assertEqual(probe_video_height("input.mp4", "ffprobe.exe"), 1080)
 
     def test_ass_color_uses_ass_bgr_and_inverse_alpha(self):
         self.assertEqual(ass_color("#12AB34"), "&H0034AB12&")
@@ -103,8 +132,8 @@ class SubtitleExportTests(unittest.TestCase):
         self.assertEqual(merged.input_video, "video.mp4")
         self.assertEqual(merged.subtitle_path, "captions.srt")
         self.assertEqual(merged.output_video, "rendered.mp4")
-        # 20px UI 字号 × 1.5 mpv 缩放 × (1000 / 720) 分辨率比例。
-        self.assertEqual(merged.subtitle_config.font_size, 42)
+        # 20px UI 字号 × 1.5 mpv 缩放 × (1000 / 288) 分辨率比例。
+        self.assertEqual(merged.subtitle_config.font_size, int(20 * 1.5 * 1000 / 288))
         self.assertEqual(merged.subtitle_config.margin_vertical, 750)
         self.assertEqual(merged.audio_delay, 0.4)
 
@@ -125,6 +154,16 @@ class SubtitleExportTests(unittest.TestCase):
             self.assertEqual(convert_srt_to_ass(srt, ass), str(ass))
             self.assertTrue(ass.is_file())
             self.assertIn("hello", ass.read_text(encoding="utf-8-sig"))
+
+    def test_convert_srt_to_ass_writes_video_resolution_in_playres(self):
+        source = "1\n00:00:00,000 --> 00:00:01,000\nhello\n"
+        ass = srt_to_ass(
+            source,
+            SubtitleConfig(font_size=90, play_res_x=1920, play_res_y=1080),
+        )
+        self.assertIn("PlayResX: 1920", ass)
+        self.assertIn("PlayResY: 1080", ass)
+        self.assertIn("Style: Default,Microsoft YaHei,90", ass)
 
     def test_parse_progress_supports_time_and_progress_pipe(self):
         self.assertEqual(parse_ffmpeg_time("00:01:02.50"), 62.5)
@@ -151,13 +190,17 @@ class SubtitleExportTests(unittest.TestCase):
     def test_playback_state_scales_font_and_maps_position(self):
         state = PlaybackState(sub_scale=1.5, sub_font_size=20, sub_pos=25)
         config = config_for_playback_state(
-            SubtitleConfig(font_size=24, play_res_y=1000), state
+            SubtitleConfig(font_size=24, play_res_y=1080),
+            state,
+            video_width=1920,
+            video_height=1080,
         )
-        # 最终字号必须使用 GUI 基础字号 24，再乘 mpv 缩放 1.5。
-        self.assertEqual(config.font_size, 36)
+        # 最终字号必须使用 GUI 基础字号 24，再乘 mpv 缩放 1.5，
+        # 再乘视频高度 / 288 的分辨率比例。
+        self.assertEqual(config.font_size, int(24 * 1.5 * 1080 / 288))
         # mpv 的 sub-pos 从顶部计数，ASS 底部 MarginV 需要反向换算：
-        # (100 - 25) / 100 * PlayResY = 750。
-        self.assertEqual(config.margin_vertical, 750)
+        # (100 - 25) / 100 * 视频高度 = 810。
+        self.assertEqual(config.margin_vertical, 810)
         self.assertEqual(sub_pos_to_margin_v(100, 1000), 0)
         self.assertEqual(sub_pos_to_margin_v(0, 1000), 1000)
 
@@ -178,14 +221,16 @@ class SubtitleExportTests(unittest.TestCase):
             "output.mp4",
             ffmpeg_path="ffmpeg.exe",
             playback_state=state,
+            video_height=1080,
         )
         self.assertIn("-filter_complex", command)
         audio_filter = command[command.index("-filter_complex") + 1]
         self.assertIn("adelay=250:all=1", audio_filter)
         vf = command[command.index("-vf") + 1]
-        self.assertIn("force_style=", vf)
-        self.assertIn("Fontsize=48", vf)
-        self.assertIn("MarginV=540", vf)
+        # 压制读取标准 ASS 文件，样式已经写入 ASS 头部；不再依赖
+        # .srt + force_style 黑盒覆盖。
+        self.assertIn("ass=", vf)
+        self.assertNotIn("force_style=", vf)
 
     def test_command_maps_negative_audio_delay_to_trim(self):
         command = build_ffmpeg_command(
@@ -233,7 +278,7 @@ class SubtitleExportTests(unittest.TestCase):
         self.assertIsInstance(plan, ExportConfig)
         self.assertEqual(plan.input_video, "input.mp4")
         self.assertEqual(plan.subtitle_config.font_name, "SimHei")
-        self.assertEqual(plan.subtitle_config.font_size, 42)
+        self.assertEqual(plan.subtitle_config.font_size, int(20 * 1.5 * 1000 / 288))
         self.assertEqual(plan.subtitle_config.margin_vertical, 750)
         self.assertEqual(plan.sub_delay, 0.25)
         self.assertEqual(plan.audio_delay, -0.5)
@@ -254,8 +299,8 @@ class SubtitleExportTests(unittest.TestCase):
             export_config=plan,
         )
         vf = command[command.index("-vf") + 1]
-        self.assertIn("Fontsize=30", vf)
-        self.assertNotIn("Fontsize=45", vf)
+        self.assertIn("ass=", vf)
+        self.assertNotIn("force_style=", vf)
 
     def test_merge_without_mpv_preserves_gui_margin(self):
         gui = SubtitleConfig(font_size=22, margin_vertical=77)

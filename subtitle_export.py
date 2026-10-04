@@ -29,9 +29,10 @@ from playback_state import PlaybackState, playback_state_values
 
 ColorValue = Union[str, Tuple[int, int, int], Tuple[int, int, int, int], object]
 
-# 样式面板按 720p 预览设计。ASS 的 Fontsize/Outline 是脚本坐标单位，
-# 因而导出到更高分辨率的视频时必须按真实画面高度放大。
-UI_BASE_HEIGHT = 720
+# mpv/libass 在没有显式 ASS 脚本时，会把 SRT 样式映射到约 288 像素的
+# 虚拟画布。样式面板里的字号也沿用这个坐标系，因此不能把 720 当作
+# 分母：24px 在 1080p 中应按 1080 / 288 放大到约 90px。
+UI_BASE_HEIGHT = 288.0
 
 
 @dataclass
@@ -195,6 +196,11 @@ def _config_from_mapping(value: object) -> SubtitleConfig:
         position=position,
         x_offset=int(read("x_offset", "offset_x", default=0)),
         y_offset=int(read("y_offset", "offset_y", default=0)),
+        play_res_x=int(read("play_res_x", "video_width", default=1920)),
+        play_res_y=int(read("play_res_y", "video_height", default=1080)),
+        margin_horizontal=int(read("margin_horizontal", "margin_h", default=40)),
+        margin_vertical=int(read("margin_vertical", "margin_v", "bottom_margin", default=35)),
+        encoding=str(read("encoding", default="utf-8")),
     )
 
 
@@ -230,6 +236,7 @@ def config_for_playback_state(
     config: Optional[Union[SubtitleConfig, dict]] = None,
     playback_state: object = None,
     *,
+    video_width: Optional[int] = None,
     video_height: Optional[int] = None,
     reference_height: Union[int, float] = UI_BASE_HEIGHT,
 ) -> SubtitleConfig:
@@ -266,7 +273,12 @@ def config_for_playback_state(
     if playback_state is None or not values or (
         isinstance(playback_state, Mapping) and not (has_scale or has_position)
     ):
-        return resolution_scaled_config(base, video_height, reference_height=reference_height)
+        return resolution_scaled_config(
+            base,
+            video_height,
+            video_width=video_width,
+            reference_height=reference_height,
+        )
 
     # 对部分字段缺失的 IPC 字典分别回退：缩放默认为 1；位置保留面板
     # 的 MarginV，避免一个不完整快照把字幕突然推到画面底边。
@@ -298,16 +310,36 @@ def config_for_playback_state(
         except (TypeError, ValueError):
             position = 100.0
         raw_margin = int(round((100.0 - position) * max(1, int(height)) / 100.0))
-    scaled_font = max(1, int(round(base_size * scale)))
-    max_margin = max(0, max(1, int(height)) - scaled_font - base.margin_vertical)
+    # 在最后一步一次性取整，避免先把 sub-scale 四舍五入再乘分辨率导致
+    # 与规范公式 ``int(base * sub_scale * video_height / 288)`` 有偏差。
+    factor = _resolution_scale(video_height, reference_height=reference_height)
+    final_font = max(1, int(base_size * scale * factor))
+    max_margin = max(0, max(1, int(height)) - final_font - base.margin_vertical)
     margin_v = min(raw_margin, max_margin)
-    merged = base.copy(
-        font_size=max(1, int(round(base_size * scale))),
+    final_outline = max(0, int(base.outline_width * factor)) or 1
+    # mpv sub-pos 已经按真实视频高度换算为 MarginV，不能再次乘
+    # video_height / 288；没有 sub-pos 时才按面板坐标缩放下边距。
+    if raw_position is None:
+        margin_v = max(0, int(base.margin_vertical * factor))
+    play_res_x = base.play_res_x
+    play_res_y = base.play_res_y
+    try:
+        if video_width is not None and float(video_width) > 0:
+            play_res_x = int(float(video_width))
+    except (TypeError, ValueError):
+        pass
+    try:
+        if video_height is not None and float(video_height) > 0:
+            play_res_y = int(float(video_height))
+    except (TypeError, ValueError):
+        pass
+    return base.copy(
+        font_size=final_font,
+        outline_width=final_outline,
         margin_vertical=margin_v,
+        play_res_x=play_res_x,
+        play_res_y=play_res_y,
     )
-    # 这里一次性完成 GUI 字号 × mpv sub-scale × 视频高度/720，后续
-    # ASS 转换和 force_style 都只读取 merged，避免重复放大。
-    return resolution_scaled_config(merged, video_height, reference_height=reference_height)
 
 
 def merge_export_config(
@@ -317,6 +349,7 @@ def merge_export_config(
     subtitle_path: Union[str, os.PathLike[str]],
     output_video: Union[str, os.PathLike[str]],
     *,
+    video_width: Optional[int] = None,
     video_height: Optional[int] = None,
 ) -> ExportConfig:
     """合并 GUI 配置、mpv 快照和文件路径，返回唯一导出真相。
@@ -326,16 +359,30 @@ def merge_export_config(
     线程中不再回读 GUI 控件或活跃的 mpv 对象。
     """
 
-    # 在创建导出快照前探测一次源视频高度，确保后台线程只消费已经
-    # 计算好的最终字号/描边，ASS 文件与 force_style 始终使用同一份配置。
-    if video_height is None:
-        video_height = probe_video_height(input_video)
+    # 在创建导出快照前探测一次源视频尺寸，确保后台线程只消费已经
+    # 计算好的最终字号/描边，标准 ASS 文件直接使用这一份配置。
+    if video_width is None or video_height is None:
+        dimensions = probe_video_dimensions(input_video)
+        if isinstance(dimensions, tuple):
+            probed_width, probed_height = dimensions
+            if video_width is None:
+                video_width = probed_width
+            if video_height is None:
+                video_height = probed_height
+        elif isinstance(dimensions, (int, float)) and video_height is None:
+            # 兼容旧版/测试替身只返回视频高度的探测器。
+            try:
+                if float(dimensions) > 0:
+                    video_height = int(float(dimensions))
+            except (TypeError, ValueError):
+                pass
     values = playback_state_values(playback_state)
     # None 表示当前没有 mpv 播放器：此时必须完整保留 GUI 自己的
     # MarginV/位置设置，不能把 PlaybackState 的默认 sub-pos=100 当成覆盖。
     effective_style = config_for_playback_state(
         gui_config,
         playback_state,
+        video_width=video_width,
         video_height=video_height,
     )
     # SubtitleConfig 本身是可变 dataclass；即使没有连接 mpv，仍要复制一份
@@ -543,8 +590,8 @@ def _position_override(config: SubtitleConfig) -> str:
 
     if not config.x_offset and not config.y_offset:
         return ""
-    # 导出的硬字幕与 force_style 保持同一锚点：底部居中。位置变化只
-    # 通过 MarginV 表达，避免 libass 未应用 force_style 时退回左侧。
+    # 导出的硬字幕统一使用底部居中。位置变化只通过 MarginV 表达，
+    # 避免不同播放器对覆盖样式的默认对齐方式不一致。
     alignment = 2
     horizontal_index = (alignment - 1) % 3
     vertical_index = (alignment - 1) // 3
@@ -582,10 +629,9 @@ def srt_to_ass_text(
     back = ass_color(config.background_color, default_alpha=back_alpha)
     border_style = 3 if config.background_enabled else 1
     # 0px 描边在硬字幕中很容易与亮色画面融在一起；导出时给它一个
-    # 最小的可见描边，并让 ASS 头与 force_style 使用同一个值。
+    # 最小的可见描边，并让 ASS 头与导出配置使用同一个值。
     effective_outline = max(1, int(config.outline_width))
-    # 导出的硬字幕与 force_style 保持同一锚点：底部居中。位置变化只
-    # 通过 MarginV 表达，避免 libass 未应用 force_style 时退回左侧。
+    # 导出的硬字幕统一使用底部居中。位置变化只通过 MarginV 表达。
     alignment = 2
     # ASS 样式字段顺序固定，避免不同 FFmpeg 版本解析失败。
     header = f"""[Script Info]
@@ -672,7 +718,7 @@ def convert_srt_to_ass(
 
 
 def escape_subtitles_filter_path(path: Union[str, os.PathLike[str]]) -> str:
-    """转义 FFmpeg subtitles 滤镜里的文件路径。
+    """转义 FFmpeg ``ass``/``subtitles`` 滤镜里的文件路径。
 
     FFmpeg 滤镜表达式仍会解析 Windows 盘符的冒号，即便 subprocess 使用
     参数列表而不是 shell，因此这里必须将 ``C:\\`` 规范成 ``C\\:/``。
@@ -687,15 +733,14 @@ def escape_subtitles_filter_path(path: Union[str, os.PathLike[str]]) -> str:
 def _resolution_scale(
     video_height: Optional[Union[int, float]],
     *,
-    reference_height: Union[int, float] = 720,
+    reference_height: Union[int, float] = UI_BASE_HEIGHT,
 ) -> float:
     """Return the UI-to-video scale used for ASS font metrics.
 
-    The style controls are designed around a 720p preview.  libass interprets
-    ``Fontsize`` and ``Outline`` in the subtitle script's coordinate system,
-    so passing the raw UI value to a 1080p (or 2160p) video makes the rendered
-    text look much smaller.  Invalid probe results deliberately return ``1``
-    so older callers keep their previous behaviour.
+    The style controls are designed around libass's 288px SRT virtual canvas.
+    Passing the raw UI value to a 1080p (or 2160p) video makes the rendered
+    text much smaller, so use ``video_height / 288``. Invalid probe results
+    deliberately return ``1`` so an otherwise valid export can continue.
     """
 
     try:
@@ -712,38 +757,73 @@ def resolution_scaled_config(
     config: Optional[Union[SubtitleConfig, dict]] = None,
     video_height: Optional[Union[int, float]] = None,
     *,
-    reference_height: Union[int, float] = 720,
+    video_width: Optional[Union[int, float]] = None,
+    reference_height: Union[int, float] = UI_BASE_HEIGHT,
+    scale_margin: bool = True,
 ) -> SubtitleConfig:
-    """Scale font metrics from the 720p UI coordinate space to a video.
+    """Scale ASS metrics from the 288px SRT UI coordinate space to a video.
 
     ``config.font_size`` is expected to already contain the mpv ``sub-scale``
     merge.  Applying this helper exactly once therefore gives
-    ``GUI字号 * sub_scale * video_height / 720``.  The original object is
-    copied, so the immutable :class:`ExportConfig` snapshot remains untouched.
+    ``GUI字号 * sub_scale * video_height / 288``.  ``scale_margin`` controls
+    whether ``margin_vertical`` is in UI coordinates (the default) or has
+    already been mapped from mpv's ``sub-pos`` to real video pixels. The
+    original object is copied, so the immutable :class:`ExportConfig` snapshot
+    remains untouched.
     """
 
     current = _config_from_mapping(config or SubtitleConfig())
     factor = _resolution_scale(video_height, reference_height=reference_height)
     try:
-        scaled_size = max(1, int(round(float(current.font_size) * factor)))
+        scaled_size = max(1, int(float(current.font_size) * factor))
     except (TypeError, ValueError):
         scaled_size = max(1, int(current.font_size))
     try:
-        outline = max(0, int(round(float(current.outline_width) * factor)))
+        outline = max(0, int(float(current.outline_width) * factor))
     except (TypeError, ValueError):
         outline = max(0, int(current.outline_width))
     # A zero outline is almost invisible on bright footage.  Use the smallest
     # useful fallback while preserving a configured non-zero outline.
     if outline == 0:
         outline = 1
-    return current.copy(font_size=scaled_size, outline_width=outline)
+    if scale_margin:
+        try:
+            margin_vertical = max(0, int(float(current.margin_vertical) * factor))
+        except (TypeError, ValueError):
+            margin_vertical = max(0, int(current.margin_vertical))
+    else:
+        margin_vertical = max(0, int(current.margin_vertical))
+
+    # 标准 ASS 文件的坐标系应与输入视频保持一致，避免 libass 在滤镜
+    # 中再做一次隐式的宽高比例换算。
+    play_res_x = current.play_res_x
+    play_res_y = current.play_res_y
+    if video_width is not None:
+        try:
+            if float(video_width) > 0:
+                play_res_x = int(round(float(video_width)))
+        except (TypeError, ValueError):
+            pass
+    if video_height is not None:
+        try:
+            if float(video_height) > 0:
+                play_res_y = int(round(float(video_height)))
+        except (TypeError, ValueError):
+            pass
+    return current.copy(
+        font_size=scaled_size,
+        outline_width=outline,
+        margin_vertical=margin_vertical,
+        play_res_x=play_res_x,
+        play_res_y=play_res_y,
+    )
 
 
 def force_style_from_config(
     config: Optional[Union[SubtitleConfig, dict]] = None,
     *,
     video_height: Optional[Union[int, float]] = None,
-    reference_height: Union[int, float] = 720,
+    reference_height: Union[int, float] = UI_BASE_HEIGHT,
 ) -> str:
     """生成 FFmpeg ``subtitles`` 滤镜的 ``force_style`` 值。
 
@@ -753,9 +833,8 @@ def force_style_from_config(
     """
 
     current = _config_from_mapping(config or SubtitleConfig())
-    # ``current.font_size`` already includes mpv's sub-scale when the export
-    # snapshot is built.  Resolution scaling is applied here once, immediately
-    # before command construction, so a 24px UI value at 1080p becomes 36px.
+    # Resolution scaling is applied here for this compatibility helper, so a
+    # 24px UI value at 1080p follows the 288px reference and becomes 90px.
     current = resolution_scaled_config(current, video_height, reference_height=reference_height)
 
     def style_color(value: ColorValue, *, opacity: int = 255) -> str:
@@ -810,16 +889,17 @@ def build_hardsub_command(
     progress_pipe: bool = False,
     subtitle_config: Optional[Union[SubtitleConfig, dict]] = None,
     playback_state: object = None,
+    video_width: Optional[int] = None,
     video_height: Optional[int] = None,
-    reference_height: int = 720,
+    reference_height: int = int(UI_BASE_HEIGHT),
     audio_delay: Optional[float] = None,
     export_config: Optional[ExportConfig] = None,
 ) -> list[str]:
     """构建 ``subprocess.Popen`` 可直接使用的 FFmpeg 参数列表。
 
     ``playback_state`` 可以是 :class:`PlaybackState`、字典或任意具有同名
-    属性的对象。传入后会将字号/位置写入 ``force_style``，并把音频延迟
-    映射成 ``adelay``（正数）或 ``atrim``（负数）。为了兼容旧调用，所有
+    属性的对象。传入后会将字号/位置写入临时 ASS，并把音频延迟映射成
+    ``adelay``（正数）或 ``atrim``（负数）。为了兼容旧调用，所有
     新参数都是可选的。
     """
 
@@ -836,20 +916,32 @@ def build_hardsub_command(
     else:
         input_video = str(input_video)
         output_video = str(output_video)
-        # Resolve the source height at the last possible moment. This keeps
-        # old callers working while making the generated ASS resolution aware.
-        if video_height is None:
-            video_height = probe_video_height(input_video, ffprobe_binary(ffmpeg_path))
+        # Resolve the source dimensions at the last possible moment. This
+        # keeps old callers working while making the generated ASS resolution
+        # aware whenever this compatibility builder is used directly.
+        if video_width is None or video_height is None:
+            dimensions = probe_video_dimensions(input_video, ffprobe_binary(ffmpeg_path))
+            if isinstance(dimensions, tuple):
+                probed_width, probed_height = dimensions
+                if video_width is None:
+                    video_width = probed_width
+                if video_height is None:
+                    video_height = probed_height
+            elif isinstance(dimensions, (int, float)) and video_height is None:
+                video_height = int(dimensions)
         effective_config = config_for_playback_state(
             subtitle_config,
             playback_state,
+            video_width=video_width,
             video_height=video_height,
             reference_height=reference_height,
         )
     # effective_config 已经完成了 mpv 缩放与分辨率缩放；此处不能再次
     # 传入 video_height，否则会重复放大字号和描边。
-    style = force_style_from_config(effective_config)
-    ass_filter = f"subtitles='{escape_subtitles_filter_path(ass_path)}':force_style='{style}'"
+    # 这里使用标准 ASS 滤镜。样式、PlayResX/PlayResY 和事件时间轴都已
+    # 写入临时 ASS，避免 FFmpeg 直接解析 SRT 时把字体、字号或对齐方式
+    # 丢掉；命令只使用 ass 滤镜读取这个标准文件。
+    ass_filter = f"ass='{escape_subtitles_filter_path(ass_path)}'"
     command = [str(ffmpeg_path), "-hide_banner"]
     command.append("-y" if overwrite else "-n")
     command.extend(["-i", input_video, "-vf", ass_filter])
@@ -914,20 +1006,15 @@ def ffprobe_binary(ffmpeg_path: Optional[Union[str, os.PathLike[str]]] = None) -
     return str(sibling) if sibling.exists() else probe_name
 
 
-def probe_video_height(
+def probe_video_dimensions(
     video_path: Union[str, os.PathLike[str]],
     ffprobe_path: Optional[Union[str, os.PathLike[str]]] = None,
-) -> Optional[int]:
-    """Read the first video stream height using ``ffprobe``.
+) -> Optional[Union[tuple[int, int], int]]:
+    """使用 ``ffprobe`` 读取第一个视频流的 ``(width, height)``。
 
-    ``ffprobe`` is intentionally invoked with an argument list rather than a
-    shell command.  This handles paths containing spaces and non-ASCII
-    characters on Windows and makes the helper straightforward to mock in
-    tests.  ``None`` means probing was unavailable; callers then retain the
-    720p/UI coordinate behaviour instead of aborting an otherwise valid
-    export.
+    使用参数列表而非 shell 字符串，可安全处理 Windows 盘符、空格和
+    中文路径。探测失败返回 ``None``，调用方会回退到配置里的坐标尺寸。
     """
-
     command = [
         str(ffprobe_path or ffprobe_binary()),
         "-v",
@@ -935,9 +1022,8 @@ def probe_video_height(
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=height",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
+        "stream=width,height",
+        "-of", "csv=p=0:s=x",
         str(video_path),
     ]
     try:
@@ -954,12 +1040,40 @@ def probe_video_height(
     except (OSError, subprocess.SubprocessError):
         return None
     for line in str(completed.stdout or "").splitlines():
+        raw_line = line.strip().lower().replace(" ", "")
+        values = re.split(r"[x,]", raw_line)
+        if len(values) >= 2:
+            try:
+                width = int(float(values[0]))
+                height = int(float(values[1]))
+            except (TypeError, ValueError):
+                continue
+            if width > 0 and height > 0:
+                return width, height
+        # 兼容旧测试替身或旧 ffprobe 输出只有高度的情况；
+        # probe_video_height 会识别这个历史返回值。
         try:
             value = int(float(line.strip()))
         except (TypeError, ValueError):
             continue
         if value > 0:
             return value
+    return None
+
+
+def probe_video_height(
+    video_path: Union[str, os.PathLike[str]],
+    ffprobe_path: Optional[Union[str, os.PathLike[str]]] = None,
+) -> Optional[int]:
+    """兼容旧调用，仅返回视频高度。"""
+
+    dimensions = probe_video_dimensions(video_path, ffprobe_path)
+    if isinstance(dimensions, tuple):
+        return dimensions[1]
+    # probe_video_dimensions historically returned a bare height for callers
+    # that mocked the old ``stream=height`` command. Keep that compatibility.
+    if isinstance(dimensions, int):
+        return dimensions
     return None
 
 
@@ -1116,6 +1230,7 @@ __all__ = [
     "playback_state_values",
     "merge_export_config",
     "probe_duration",
+    "probe_video_dimensions",
     "probe_video_height",
     "probe_media_duration",
     "srt_to_ass",
