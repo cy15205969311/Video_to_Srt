@@ -2,8 +2,9 @@
 
 该模块保持独立，不依赖主窗口状态。主窗口可以在用户选择（或当前工作流
 已经生成）字幕文件后创建 :class:`SubtitleEditorDialog`，然后调用
-``dialog.exec_()``。解析和写回逻辑也提供了无界面的函数，方便测试以及其它
-工作流复用::
+``dialog.exec_()``。机器翻译流程也可以把尚未落盘的 ``entries`` 列表直接
+传入，编辑器会把结果保留在内存中，直到用户点击保存。解析和写回逻辑也
+提供了无界面的函数，方便测试以及其它工作流复用::
 
     entries = parse_srt_file("captions.srt")
     write_srt_file("captions.srt", entries)
@@ -241,12 +242,71 @@ class SubtitleEditorDialog(QDialog):
         subtitle_path: Optional[Union[str, os.PathLike[str]]] = None,
         parent: Optional[QWidget] = None,
         entries: Optional[Sequence[Mapping[str, Any]]] = None,
+        default_output_path: Optional[Union[str, os.PathLike[str]]] = None,
+        output_path: Optional[Union[str, os.PathLike[str]]] = None,
     ) -> None:
+        """创建字幕编辑器。
+
+        ``entries`` 用于人机协同翻译流程：调用方可以把尚未落盘的机翻结果
+        直接传进来，编辑器只在用户点击“保存修改”并确认输出路径后才写文件。
+        这种模式下 ``subtitle_path`` 仅用于推导建议文件名，绝不会被当作要
+        覆盖的目标文件。为了兼容不同调用方，``output_path`` 是
+        ``default_output_path`` 的别名；两个参数同时传入时以后者（显式的
+        ``output_path``）为准。
+
+        旧的文件编辑模式仍然保持兼容：只传 ``subtitle_path`` 时会读取该文件，
+        “保存修改”直接原子覆盖它，“另存为…”则打开新的目标路径。
+        """
+        # 允许常见的 ``SubtitleEditorDialog(parent, entries=...)`` 调用。
+        # 历史实现的第一个位置参数是字幕路径，因此只有明确传入 entries
+        # 且首参确实是 QWidget 时才把它解释为 parent。
+        if (
+            entries is None
+            and isinstance(subtitle_path, QWidget)
+            and parent is not None
+            and not isinstance(parent, QWidget)
+        ):
+            # 兼容 ``SubtitleEditorDialog(parent, entries)`` 的位置参数形式。
+            entries = parent  # type: ignore[assignment]
+            parent = subtitle_path
+            subtitle_path = None
+        elif entries is not None and isinstance(subtitle_path, QWidget) and parent is None:
+            parent = subtitle_path
+            subtitle_path = None
+
+        # 允许简洁的 ``SubtitleEditorDialog(entries, parent)`` 调用，同时
+        # 保持历史上的 ``SubtitleEditorDialog(path, parent)`` 语义。只有非
+        # 路径对象才会被视作内存字幕，避免把 Windows 路径误判成序列。
+        if (
+            entries is None
+            and subtitle_path is not None
+            and not isinstance(subtitle_path, (str, bytes, os.PathLike))
+        ):
+            entries = subtitle_path  # type: ignore[assignment]
+            subtitle_path = None
+
         super().__init__(parent)
         self.setWindowTitle("审阅与校对字幕")
         self.setMinimumSize(800, 600)
         self.resize(900, 680)
+        # subtitle_path 表示已经加载/保存成功的真实文件。内存模式初始为空，
+        # 避免点击“保存修改”时误覆盖机翻源字幕。
         self.subtitle_path = ""
+        self.default_output_path = ""
+        if output_path is not None:
+            default_output_path = output_path
+        if default_output_path:
+            self.default_output_path = str(Path(default_output_path))
+        elif entries is not None and subtitle_path:
+            # 传入源字幕路径和内存翻译结果时，默认目标使用安全的新文件名。
+            source = Path(subtitle_path)
+            self.default_output_path = str(
+                source.with_name(f"{source.stem}_translated.srt")
+            )
+        self._memory_mode = entries is not None
+        self._source_path = str(Path(subtitle_path)) if subtitle_path else ""
+        self.edited_entries: List[SrtEntry] = []
+        self.saved = False
         self._loaded = False
 
         self.path_label = QLabel("尚未选择字幕文件")
@@ -292,8 +352,26 @@ class SubtitleEditorDialog(QDialog):
         layout.addLayout(button_layout)
 
         if entries is not None:
-            self._populate_table(entries)
-            self._loaded = True
+            try:
+                self._populate_table(entries)
+            except (TypeError, ValueError, KeyError, SrtParseError) as exc:
+                # 内存数据来自翻译线程，理论上应该已经结构化；如果第三方
+                # 翻译器传入了坏数据，给出和文件加载一致的友好提示。
+                QMessageBox.warning(self, "无法打开字幕", f"内存字幕数据无效：{exc}")
+                self.save_button.setEnabled(False)
+                self.save_as_button.setEnabled(False)
+                self._loaded = False
+            else:
+                self._loaded = True
+                if self.default_output_path:
+                    self.path_label.setText(
+                        "翻译结果暂存于内存，保存时将默认输出到："
+                        f"{self.default_output_path}"
+                    )
+                else:
+                    self.path_label.setText(
+                        "翻译结果暂存于内存，点击“保存修改”选择输出文件"
+                    )
         elif subtitle_path:
             self.load_file(subtitle_path)
         else:
@@ -328,6 +406,10 @@ class SubtitleEditorDialog(QDialog):
             self._loaded = False
             return False
         self.subtitle_path = str(Path(path))
+        self._source_path = self.subtitle_path
+        self.default_output_path = ""
+        self._memory_mode = False
+        self.saved = False
         self.path_label.setText(f"文件：{self.subtitle_path}")
         self._populate_table(parsed)
         self.save_button.setEnabled(True)
@@ -336,6 +418,10 @@ class SubtitleEditorDialog(QDialog):
         return True
 
     def _populate_table(self, entries: Sequence[Mapping[str, Any]]) -> None:
+        if entries is None:
+            raise TypeError("字幕数据不能为空。")
+        # 先物化，既支持普通 list，也能给出 generator/错误对象的清晰异常。
+        entries = list(entries)
         self.table.setRowCount(0)
         self.table.setRowCount(len(entries))
         for row, entry in enumerate(entries):
@@ -391,6 +477,10 @@ class SubtitleEditorDialog(QDialog):
             QMessageBox.warning(self, "保存失败", str(exc))
             return False
         self.subtitle_path = str(Path(path))
+        self.default_output_path = self.subtitle_path
+        self.edited_entries = entries
+        self.saved = True
+        self._memory_mode = False
         self.path_label.setText(f"文件：{self.subtitle_path}")
         QMessageBox.information(self, "保存成功", "字幕修改已保存。")
         self.accept()
@@ -406,9 +496,15 @@ class SubtitleEditorDialog(QDialog):
     def save_as(self) -> bool:
         """选择新的 ``*_edited.srt`` 路径并保存。"""
 
-        default = self.subtitle_path
-        if default:
-            source = Path(default)
+        # 内存模式优先使用调用方提供的建议输出路径；如果没有建议路径，
+        # 传入了源路径则默认落到 ``*_translated.srt``，普通文件编辑模式则
+        # 继续使用原来的 ``*_edited.srt``。
+        default = self.default_output_path
+        if not default and self._memory_mode and self._source_path:
+            source = Path(self._source_path)
+            default = str(source.with_name(f"{source.stem}_translated.srt"))
+        if not default and self.subtitle_path:
+            source = Path(self.subtitle_path)
             default = str(source.with_name(f"{source.stem}_edited.srt"))
         path, _ = QFileDialog.getSaveFileName(
             self, "另存字幕", default, "SRT 字幕文件 (*.srt);;所有文件 (*)"

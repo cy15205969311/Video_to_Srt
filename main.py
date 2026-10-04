@@ -1,6 +1,6 @@
 from PyQt5.QtGui import QTextCursor
 import autosub_API
-from translation import get_token, read_subtitle_file, translate_text, write_subtitle_file
+from translation import get_token, read_subtitle_file, translate_text
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QComboBox, QTextEdit, QFileDialog, QLabel, QHBoxLayout, \
     QDialog
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
@@ -14,7 +14,7 @@ from multiprocessing import freeze_support
 from pathlib import Path
 from audio_translation import translate_media_to_english_mp3
 from subtitle_style_dialog import SubtitleStyleDialog
-from subtitle_editor_dialog import SubtitleEditorDialog
+from subtitle_editor_dialog import SubtitleEditorDialog, parse_srt_text, SrtParseError
 from playback_state import get_playback_state
 from mpv_controller import MpvController
 from subtitle_export import SubtitleConfig
@@ -68,7 +68,10 @@ class GenerateSubtitlesThread(QThread):
         self.progress_signal.emit(value)
 
 class TranslateSubtitleThread(QThread):
-    signal = pyqtSignal(str)
+    # 翻译结果通过 Qt 的 object 信号直接传回内存中的字幕记录；线程不负责
+    # 写文件，只有用户在校对面板点击“保存”后才会落盘。
+    signal = pyqtSignal(object)
+    error_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int)  # 用于更新进度条的信号
 
     def __init__(self, subtitle_path, to_lang, include_original=True):
@@ -78,26 +81,39 @@ class TranslateSubtitleThread(QThread):
         self.include_original = include_original
 
     def run(self):
-        token = get_token()
-        subtitle_content = read_subtitle_file(self.subtitle_path)
+        try:
+            token = get_token()
+            if not token:
+                raise RuntimeError("获取百度翻译令牌失败，请检查网络和翻译密钥。")
+            subtitle_content = read_subtitle_file(self.subtitle_path)
 
-        # 调用翻译函数时传递更新进度的回调
-        translated_content = translate_text(
-            subtitle_content,
-            token,
-            self.to_lang,
-            self.include_original,
-            progress_callback=self.update_progress
-        )
-        # 根据是否包含原文来决定文件名的尾缀
-        if self.include_original:
-            suffix = "zh&en"
-        else:
-            suffix = self.to_lang
-        # 保存翻译后的字幕
-        output_file_path = self.subtitle_path.rsplit('.', 1)[0] + '-' + suffix + '.srt'
-        write_subtitle_file(translated_content, output_file_path)
-        self.signal.emit(output_file_path)  # 发送信号，传递生成字幕的结果
+            # 调用翻译函数时传递更新进度的回调。translate_text 返回 SRT 文本，
+            # 这里立即解析成结构化记录并通过信号传给 GUI；本线程绝不写入
+            # *_translated.srt，避免用户尚未校对的机器翻译污染磁盘文件。
+            translated_content = translate_text(
+                subtitle_content,
+                token,
+                self.to_lang,
+                self.include_original,
+                progress_callback=self.update_progress,
+            )
+            entries = parse_srt_text(translated_content)
+            if not entries:
+                raise SrtParseError("翻译结果为空，无法打开校对面板。")
+            source = Path(self.subtitle_path)
+            suffix = "zh&en" if self.include_original else self.to_lang
+            payload = {
+                "entries": entries,
+                "source_path": self.subtitle_path,
+                "default_output_path": str(
+                    source.with_name(f"{source.stem}_translated.srt")
+                ),
+                "suffix": suffix,
+            }
+            self.signal.emit(payload)
+        except Exception as exc:
+            # 线程异常必须通过信号返回，避免后台线程异常导致主程序退出。
+            self.error_signal.emit(str(exc))
 
     def update_progress(self, value):
         self.progress_signal.emit(value)
@@ -195,13 +211,6 @@ class MyApp(QWidget):
         btn3 = QPushButton('字幕文件翻译', self)
         btn3.clicked.connect(self.translateSubtitle)
 
-        # 字幕翻译完成后可直接在程序内审阅、修改并保存 SRT 文件。
-        # 单独占一行可以避免挤压上方“下拉框 + 翻译”操作行，
-        # 同时让入口始终位于字幕翻译功能附近。
-        btnReviewSubtitle = QPushButton('审阅与校对字幕', self)
-        btnReviewSubtitle.clicked.connect(self.openSubtitleEditor)
-        self.reviewSubtitleButton = btnReviewSubtitle
-
         self.audioDirectionComboBox = QComboBox(self)
         self.audioDirectionComboBox.addItem("中文转换为英文")
         self.audioDirectionComboBox.addItem("英文转换成中文")
@@ -243,7 +252,6 @@ class MyApp(QWidget):
         vbox.addWidget(btn1)
         vbox.addLayout(hboxGenerateSubtitles)  # 添加视频生成字幕和语言选择的水平布局
         vbox.addLayout(hboxTranslateSubtitle)  # 添加字幕文件翻译和语言选择的水平布局
-        vbox.addWidget(btnReviewSubtitle)
         vbox.addLayout(hboxAudioTranslation)
         vbox.addWidget(btnHardSubtitle)
         vbox.addWidget(btn4)
@@ -300,12 +308,13 @@ class MyApp(QWidget):
 
         fname = QFileDialog.getOpenFileName(self, 'Select Subtitle', './')
         if fname[0]:
-            # 先记录源字幕路径；翻译线程完成后 onFinished 会更新为新生成的路径。
-            self.current_subtitle_path = fname[0]
+            # 仅记录源文件供线程读取和生成建议文件名。翻译结果暂存内存，
+            # 在用户完成校对并点击保存前，不改变当前可用于硬字幕导出的路径。
             self.textbox.setText("字幕文件正在翻译，请耐心等待...")
             # 在这里创建线程时传递include_original参数
             self.thread = TranslateSubtitleThread(fname[0], to_lang, include_original)
-            self.thread.signal.connect(self.onFinished)  # 连接信号和槽函数
+            self.thread.signal.connect(self.onTranslationFinished)
+            self.thread.error_signal.connect(self.onTranslationFailed)
             self.thread.progress_signal.connect(self.progressBar.setValue)  # 更新进度条
             self.thread.start()
 
@@ -401,6 +410,56 @@ class MyApp(QWidget):
         self.textbox.setText("MP3 生成失败：\n" + error)
         QMessageBox.critical(self, "生成失败", error)
 
+    def onTranslationFinished(self, payload):
+        """接收内存中的机翻结果并立即打开校对面板。
+
+        ``TranslateSubtitleThread`` 只负责调用 API 和解析 SRT，不写本地文件。
+        只有编辑器返回 ``saved=True`` 时，才把最终路径交给后续硬字幕流程。
+        用户取消/关闭窗口时，内存结果随对话框释放，不会产生半成品文件。
+        """
+
+        if not isinstance(payload, dict):
+            self.onTranslationFailed("翻译线程返回了无效的数据。")
+            return
+        entries = payload.get("entries")
+        source_path = str(payload.get("source_path") or "")
+        default_output_path = str(payload.get("default_output_path") or "")
+        if not entries:
+            self.onTranslationFailed("翻译结果为空，无法打开校对面板。")
+            return
+
+        self.progressBar.setValue(100)
+        self.textbox.setText("机器翻译完成，请在校对面板中检查并保存。")
+        try:
+            dialog = SubtitleEditorDialog(
+                subtitle_path=source_path or None,
+                parent=self,
+                entries=entries,
+                default_output_path=default_output_path or None,
+            )
+        except Exception as exc:
+            self.onTranslationFailed(f"打开字幕校对面板失败：{exc}")
+            return
+        if not dialog.is_loaded:
+            return
+
+        result = dialog.exec_()
+        if result == QDialog.Accepted and getattr(dialog, "saved", False):
+            saved_path = str(getattr(dialog, "subtitle_path", "") or "")
+            if saved_path:
+                self.current_subtitle_path = saved_path
+                self.textbox.setText("字幕校对完成，文件已保存到：\n" + saved_path)
+                return
+        self.textbox.setText("已取消字幕校对，翻译结果未保存。")
+
+    def onTranslationFailed(self, error):
+        """在主线程中显示翻译或解析失败原因。"""
+
+        self.progressBar.setValue(0)
+        message = str(error or "字幕翻译失败。")
+        self.textbox.setText("字幕翻译失败：\n" + message)
+        QMessageBox.critical(self, "翻译失败", message)
+
     def openSubtitleExport(self):
         """打开字幕样式面板，在独立线程中执行硬字幕压制。"""
         dialog = SubtitleStyleDialog(
@@ -488,46 +547,11 @@ class MyApp(QWidget):
         event.accept()
 
     def onFinished(self, result):
-        # 生成/翻译线程都通过该槽返回文件路径。记录 SRT 路径，
-        # 这样用户点击“审阅与校对字幕”时可以直接打开刚生成的文件。
+        # 视频生成字幕线程返回已落盘的 SRT 路径。
         if result and str(result).lower().endswith(".srt") and os.path.isfile(str(result)):
             self.current_subtitle_path = str(result)
         self.textbox.setText("文件生成地址：" + result)
         self.showSuccessMessage()
-
-    def openSubtitleEditor(self):
-        """打开可视化字幕校对器。
-
-        优先使用当前工作流最近生成/翻译的 SRT；如果路径不存在，
-        再让用户通过文件选择框指定待校对字幕。编辑器自身负责解析、
-        展示和保存，保存成功后继续保留该路径供后续硬字幕导出使用。
-        """
-
-        subtitle_path = self.current_subtitle_path
-        if not subtitle_path or not os.path.isfile(str(subtitle_path)):
-            subtitle_path, _ = QFileDialog.getOpenFileName(
-                self,
-                "选择待校对的字幕文件",
-                "./",
-                "字幕文件 (*.srt);;所有文件 (*)",
-            )
-        if not subtitle_path:
-            return
-
-        try:
-            dialog = SubtitleEditorDialog(str(subtitle_path), self)
-        except (OSError, ValueError, RuntimeError) as exc:
-            QMessageBox.critical(self, "打开字幕失败", str(exc))
-            return
-        if not dialog.is_loaded:
-            # 构造阶段已显示具体解析/编码错误；避免再打开一个空的编辑器。
-            return
-
-        # 仅在编辑器正常接受关闭（通常表示保存成功）后更新路径。
-        # 保存时可能选择了“另存为”，因此读取编辑器最终路径而不是继续
-        # 使用打开时的旧路径，确保后续硬字幕导出使用用户刚保存的文件。
-        if dialog.exec_() == QDialog.Accepted:
-            self.current_subtitle_path = str(dialog.subtitle_path or subtitle_path)
 
 if __name__ == '__main__':
     freeze_support()  # 在程序入口处调用freeze_support
