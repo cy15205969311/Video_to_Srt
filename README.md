@@ -224,8 +224,8 @@ python -m pytest -q
 
 ![主界面](icon/图片1.png)
 
-![字幕生成](icon/图片2.png)
+![双栏字幕校对](icon/图片2.png)
 
-![字幕翻译](icon/图片3.png)
+![字幕样式与硬字幕导出](icon/图片3.png)
 
-![播放器与导出](icon/图片4.png)
+![mpv 播放预览](icon/图片4.png)
