@@ -9,9 +9,9 @@
     entries = parse_srt_file("captions.srt")
     write_srt_file("captions.srt", entries)
 
-SRT 的序号和时间轴在表格中只读，字幕内容使用 ``QPlainTextEdit`` 编辑器，因此
-中英双语字幕中的换行可以直接保留。写文件采用同目录临时文件加原子替换，
-避免程序在写入过程中退出而破坏原字幕文件。
+SRT 的序号、时间轴和原文在表格中只读，译文/双语内容使用 ``QPlainTextEdit``
+编辑器，因此中英双语字幕中的换行可以直接保留。写文件采用同目录临时文件
+加原子替换，避免程序在写入过程中退出而破坏原字幕文件。
 """
 
 from __future__ import annotations
@@ -211,7 +211,9 @@ class _MultilineTextDelegate(QStyledItemDelegate):
         editor.setTabChangesFocus(False)
         editor.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         editor.setFont(parent.font())
-        editor.setMinimumHeight(max(42, option.rect.height))
+        # ``QRect.height`` 是方法而不是属性；省略括号会把方法对象传给
+        # ``max``，导致双击单元格时抛出 ``TypeError``。
+        editor.setMinimumHeight(max(42, option.rect.height()))
         return editor
 
     def setEditorData(self, editor: QWidget, index: QModelIndex) -> None:
@@ -234,7 +236,9 @@ class SubtitleEditorDialog(QDialog):
 
     ``subtitle_path`` 可以直接传入当前工作流的字幕路径；为空时会弹出文件
     选择框。传入路径无效或解析失败时，错误会通过友好提示框显示，并保持对
-    话框可关闭，不会让主程序崩溃。
+    话框可关闭，不会让主程序崩溃。内存模式的记录应优先使用
+    ``original_text`` 和 ``translated_text`` 字段，表格会把前者作为只读对照、
+    后者作为可编辑内容；旧的 ``text`` 字段仍然兼容。
     """
 
     def __init__(
@@ -311,8 +315,11 @@ class SubtitleEditorDialog(QDialog):
 
         self.path_label = QLabel("尚未选择字幕文件")
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.table = QTableWidget(0, 3, self)
-        self.table.setHorizontalHeaderLabels(["序号", "时间轴", "字幕内容"])
+        # 双栏对照：原文固定只读，译文/双语列交给校对人员修改。
+        self.table = QTableWidget(0, 4, self)
+        self.table.setHorizontalHeaderLabels(
+            ["序号", "时间轴", "原文 (只读)", "译文/双语 (可编辑)"]
+        )
         self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(
@@ -322,13 +329,14 @@ class SubtitleEditorDialog(QDialog):
         )
         self.table.setWordWrap(True)
         self.table.setAlternatingRowColors(True)
-        self.table.setItemDelegateForColumn(2, _MultilineTextDelegate(self.table))
+        self.table.setItemDelegateForColumn(3, _MultilineTextDelegate(self.table))
         self.table.itemChanged.connect(self._on_item_changed)
         header = self.table.horizontalHeader()
         header.setStretchLastSection(True)
         header.setMinimumSectionSize(70)
         header.resizeSection(0, 70)
         header.resizeSection(1, 255)
+        header.resizeSection(2, 255)
         self.table.verticalHeader().setDefaultSectionSize(48)
         self.table.verticalHeader().setMinimumSectionSize(32)
 
@@ -422,31 +430,72 @@ class SubtitleEditorDialog(QDialog):
             raise TypeError("字幕数据不能为空。")
         # 先物化，既支持普通 list，也能给出 generator/错误对象的清晰异常。
         entries = list(entries)
+        # 设置 item 时可能触发 itemChanged；先阻断信号，待整张表构造完毕
+        # 后再允许用户编辑，避免初始化阶段误调整行高或同步旧字段。
+        self.table.blockSignals(True)
         self.table.setRowCount(0)
         self.table.setRowCount(len(entries))
         for row, entry in enumerate(entries):
             index = str(_entry_value(entry, "index", "序号", default=row + 1))
             timing = str(_entry_value(entry, "time", "timing", "时间轴", default=""))
-            content = str(_entry_value(entry, "text", "content", "字幕内容", default=""))
+            # 新版机翻 payload 明确提供 original_text/translated_text。旧版
+            # ``text`` 或直接读取的 SRT 记录则将内容同时作为原文和译文，
+            # 这样现有文件编辑流程仍然可用且不丢失原字幕。
+            has_original = any(
+                key in entry for key in ("original_text", "original", "source_text")
+            )
+            has_translated = any(
+                key in entry for key in ("translated_text", "translation", "translated")
+            )
+            legacy_content = _entry_value(
+                entry, "text", "content", "字幕内容", default=""
+            )
+            original = _entry_value(
+                entry,
+                "original_text",
+                "original",
+                "source_text",
+                default=None,
+            )
+            translated = _entry_value(
+                entry,
+                "translated_text",
+                "translation",
+                "translated",
+                default=None,
+            )
+            if not has_original and not has_translated:
+                # 完全兼容旧 ``{"text": ...}`` 记录和 parse_srt_file 的输出。
+                original = translated = legacy_content
+            else:
+                if original is None:
+                    original = ""
+                if translated is None:
+                    translated = legacy_content
             index_item = QTableWidgetItem(index)
             time_item = QTableWidgetItem(timing)
-            content_item = QTableWidgetItem(content)
+            original_item = QTableWidgetItem(str(original))
+            translated_item = QTableWidgetItem(str(translated))
             index_item.setFlags(index_item.flags() & ~Qt.ItemIsEditable)
             time_item.setFlags(time_item.flags() & ~Qt.ItemIsEditable)
+            original_item.setFlags(original_item.flags() & ~Qt.ItemIsEditable)
             index_item.setTextAlignment(Qt.AlignCenter)
             time_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-            content_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            original_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            translated_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
             self.table.setItem(row, 0, index_item)
             self.table.setItem(row, 1, time_item)
-            self.table.setItem(row, 2, content_item)
+            self.table.setItem(row, 2, original_item)
+            self.table.setItem(row, 3, translated_item)
         self.table.resizeRowsToContents()
         for row in range(self.table.rowCount()):
             self.table.setRowHeight(row, max(42, self.table.rowHeight(row)))
+        self.table.blockSignals(False)
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         """编辑多行字幕后立即调整行高，避免内容被单元格裁剪。"""
 
-        if item.column() != 2:
+        if item.column() != 3:
             return
         row = item.row()
         self.table.resizeRowToContents(row)
@@ -457,14 +506,15 @@ class SubtitleEditorDialog(QDialog):
         for row in range(self.table.rowCount()):
             index_item = self.table.item(row, 0)
             time_item = self.table.item(row, 1)
-            content_item = self.table.item(row, 2)
+            translated_item = self.table.item(row, 3)
             if time_item is None or not time_item.text().strip():
                 raise SrtParseError(f"第 {row + 1} 行缺少时间轴。")
             entries.append(
                 {
                     "index": index_item.text().strip() if index_item else row + 1,
                     "time": time_item.text().strip(),
-                    "text": content_item.text() if content_item else "",
+                    # 只读取第 4 列；第 3 列始终作为只读对照参考。
+                    "text": translated_item.text() if translated_item else "",
                 }
             )
         return entries

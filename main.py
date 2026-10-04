@@ -14,7 +14,11 @@ from multiprocessing import freeze_support
 from pathlib import Path
 from audio_translation import translate_media_to_english_mp3
 from subtitle_style_dialog import SubtitleStyleDialog
-from subtitle_editor_dialog import SubtitleEditorDialog, parse_srt_text, SrtParseError
+from subtitle_editor_dialog import (
+    SubtitleEditorDialog,
+    parse_srt_text,
+    SrtParseError,
+)
 from playback_state import get_playback_state
 from mpv_controller import MpvController
 from subtitle_export import SubtitleConfig
@@ -87,6 +91,15 @@ class TranslateSubtitleThread(QThread):
                 raise RuntimeError("获取百度翻译令牌失败，请检查网络和翻译密钥。")
             subtitle_content = read_subtitle_file(self.subtitle_path)
 
+            # 先解析源字幕并保留原文。翻译函数返回的 SRT 在双语模式下
+            # 会把“译文”和“原文”拼成一个字幕块；如果这里只把翻译后的
+            # ``text`` 传给编辑器，校对时就无法知道哪一部分是原文。因此
+            # 这里同时保留源字幕记录，后面按序号/位置与翻译结果合并成
+            # ``original_text`` + ``translated_text`` 的四字段结构。
+            source_entries = parse_srt_text(subtitle_content)
+            if not source_entries:
+                raise SrtParseError("源字幕为空，无法开始翻译。")
+
             # 调用翻译函数时传递更新进度的回调。translate_text 返回 SRT 文本，
             # 这里立即解析成结构化记录并通过信号传给 GUI；本线程绝不写入
             # *_translated.srt，避免用户尚未校对的机器翻译污染磁盘文件。
@@ -97,13 +110,51 @@ class TranslateSubtitleThread(QThread):
                 self.include_original,
                 progress_callback=self.update_progress,
             )
-            entries = parse_srt_text(translated_content)
-            if not entries:
+            translated_entries = parse_srt_text(translated_content)
+            if not translated_entries:
                 raise SrtParseError("翻译结果为空，无法打开校对面板。")
+            if len(translated_entries) != len(source_entries):
+                raise SrtParseError(
+                    "翻译结果与源字幕条数不一致："
+                    f"源字幕 {len(source_entries)} 条，翻译结果 {len(translated_entries)} 条。"
+                )
+
+            # ``translate_text`` 应当逐条保留时间轴，但为了防止网络返回
+            # 内容不完整或第三方翻译器调整了序号，这里按序号优先、位置
+            # 其次进行配对。缺少任何一条时直接报错，避免把错误的译文
+            # 错配到另一条字幕上。
+            translated_by_index = {
+                str(entry.get("index")): entry for entry in translated_entries
+            }
+            merged_entries = []
+            for position, source_entry in enumerate(source_entries):
+                translated_entry = translated_by_index.get(str(source_entry.get("index")))
+                if translated_entry is None and position < len(translated_entries):
+                    translated_entry = translated_entries[position]
+                if translated_entry is None:
+                    raise SrtParseError(
+                        f"第 {position + 1} 条字幕没有对应的翻译结果。"
+                    )
+
+                translated_text = str(
+                    translated_entry.get("text", "")
+                )
+                # 对校对表格而言，源时间轴是唯一可信的时间轴；翻译 API
+                # 只负责替换内容，避免其返回的序号/时间轴被误改后导致
+                # 保存出的 SRT 与原片不同步。
+                merged_entries.append(
+                    {
+                        "index": source_entry.get("index", position + 1),
+                        "time": source_entry.get("time", ""),
+                        "original_text": str(source_entry.get("text", "")),
+                        "translated_text": translated_text,
+                    }
+                )
+
             source = Path(self.subtitle_path)
             suffix = "zh&en" if self.include_original else self.to_lang
             payload = {
-                "entries": entries,
+                "entries": merged_entries,
                 "source_path": self.subtitle_path,
                 "default_output_path": str(
                     source.with_name(f"{source.stem}_translated.srt")

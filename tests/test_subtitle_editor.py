@@ -16,6 +16,7 @@ from subtitle_editor_dialog import (  # noqa: E402
     serialize_srt,
     write_srt_file,
 )
+from PyQt5.QtCore import Qt  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -89,7 +90,8 @@ def test_in_memory_entries_are_loaded_without_creating_a_source_file(qt_app, tmp
         {
             "index": 1,
             "time": "00:00:01,000 --> 00:00:03,000",
-            "text": "机器翻译\nMachine translation",
+            "original_text": "机器翻译",
+            "translated_text": "Machine translation",
         }
     ]
     suggested = tmp_path / "video_translated.srt"
@@ -99,7 +101,11 @@ def test_in_memory_entries_are_loaded_without_creating_a_source_file(qt_app, tmp
         assert dialog.is_loaded
         assert dialog.subtitle_path == ""
         assert dialog.table.rowCount() == 1
-        assert dialog.table.item(0, 2).text() == "机器翻译\nMachine translation"
+        assert dialog.table.columnCount() == 4
+        assert dialog.table.item(0, 2).text() == "机器翻译"
+        assert dialog.table.item(0, 3).text() == "Machine translation"
+        assert not (dialog.table.item(0, 2).flags() & Qt.ItemIsEditable)
+        assert dialog.table.item(0, 3).flags() & Qt.ItemIsEditable
         assert not suggested.exists()
     finally:
         dialog.close()
@@ -112,12 +118,14 @@ def test_in_memory_editor_saves_only_after_user_confirmation(qt_app, tmp_path, m
         {
             "index": 1,
             "time": "00:00:00,000 --> 00:00:01,500",
-            "text": "原文\nOriginal",
+            "original_text": "原文",
+            "translated_text": "Original",
         },
         {
             "index": 2,
             "time": "00:00:02,000 --> 00:00:03,500",
-            "text": "第二句",
+            "original_text": "第二句",
+            "translated_text": "Second sentence",
         },
     ]
     target = tmp_path / "translated.srt"
@@ -132,7 +140,8 @@ def test_in_memory_editor_saves_only_after_user_confirmation(qt_app, tmp_path, m
         staticmethod(lambda *args, **kwargs: (str(target), "SRT 字幕文件 (*.srt)")),
     )
     try:
-        dialog.table.item(0, 2).setText("校对后的第一句\nCorrected first line")
+        # 原文列仅作对照，用户修改第 4 列译文/双语内容。
+        dialog.table.item(0, 3).setText("校对后的第一句\nCorrected first line")
         assert not target.exists()
         # ``save_changes`` is the same slot used by the visible 保存修改 button.
         # In memory mode it opens a save dialog and never overwrites the source.
@@ -149,7 +158,7 @@ def test_in_memory_editor_saves_only_after_user_confirmation(qt_app, tmp_path, m
             {
                 "index": 2,
                 "time": "00:00:02,000 --> 00:00:03,500",
-                "text": "第二句",
+                "text": "Second sentence",
             },
         ]
     finally:
@@ -183,6 +192,11 @@ def test_translation_thread_emits_memory_payload_without_writing_srt(tmp_path, m
     worker.run()
 
     assert errors == []
-    assert payloads and payloads[0]["entries"][0]["text"] == "Translation\n原文"
+    assert payloads and payloads[0]["entries"][0] == {
+        "index": 1,
+        "time": "00:00:00,000 --> 00:00:01,000",
+        "original_text": "原文",
+        "translated_text": "Translation\n原文",
+    }
     assert payloads[0]["default_output_path"].endswith("source_translated.srt")
     assert not (tmp_path / "source-zh&en.srt").exists()
